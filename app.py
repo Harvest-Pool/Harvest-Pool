@@ -125,6 +125,21 @@ def init_db():
             db.execute('ALTER TABLE pool_contributions ADD COLUMN transport_cost REAL')
         if 'packaging_cost' not in contribution_cols:
             db.execute('ALTER TABLE pool_contributions ADD COLUMN packaging_cost REAL')
+        # Demo order states are NOT real payment or delivery evidence.
+        db.execute("""CREATE TABLE IF NOT EXISTS demo_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            demand_id INTEGER NOT NULL UNIQUE REFERENCES buyer_demands(id),
+            buyer_id INTEGER NOT NULL REFERENCES buyers(id),
+            total_kg REAL NOT NULL CHECK(total_kg > 0),
+            indicative_total_cents INTEGER NOT NULL CHECK(indicative_total_cents > 0),
+            status TEXT NOT NULL DEFAULT 'Awaiting demo payment' CHECK(status IN
+                ('Awaiting demo payment','Demo payment marked','Ready for demo delivery','Demo delivery confirmed')),
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        contribution_cols = {row['name'] for row in db.execute('PRAGMA table_info(pool_contributions)')}
+        if 'demo_ready' not in contribution_cols:
+            db.execute('ALTER TABLE pool_contributions ADD COLUMN demo_ready INTEGER NOT NULL DEFAULT 0')
         # A profile can only be owned by one account within its role.
         db.execute('''CREATE UNIQUE INDEX IF NOT EXISTS unique_user_profile
                       ON users(role, profile_id) WHERE profile_id IS NOT NULL''')
@@ -294,18 +309,19 @@ def dashboard():
                                         ORDER BY id DESC''', (current_user.profile_id,)).fetchall()
             my_contributions = db.execute('''
                 SELECT pc.id, pc.quantity_kg, pc.indicative_price, pc.offer_status,
-                       pc.farmer_asking_price, pc.transport_cost, pc.packaging_cost, p.crop, hp.status,
-                       b.business_name
+                       pc.farmer_asking_price, pc.transport_cost, pc.packaging_cost, pc.demo_ready, p.crop, hp.status,
+                       b.business_name, o.id AS demo_order_id, o.status AS demo_order_status
                 FROM pool_contributions pc
                 JOIN produce_listings p ON p.id = pc.listing_id
                 JOIN harvest_pools hp ON hp.id = pc.pool_id
                 JOIN buyer_demands d ON d.id = hp.demand_id
                 JOIN buyers b ON b.id = d.buyer_id
+                LEFT JOIN demo_orders o ON o.demand_id = d.id
                 WHERE pc.farmer_id = ? ORDER BY pc.id DESC
             ''', (current_user.profile_id,)).fetchall()
             return render_template('index.html', my_listings=my_listings,
                                    my_contributions=my_contributions,
-                                   my_demands=[], market_listings=[], my_pools=[],
+                                   my_demands=[], market_listings=[], my_pools=[], demo_orders=[],
                                    heritage_crops=HERITAGE_CROPS, heritage_check=is_heritage,
                                    estimated_net=estimated_net)
         my_demands = db.execute('''SELECT * FROM buyer_demands WHERE buyer_id = ?
@@ -333,9 +349,19 @@ def dashboard():
             FROM harvest_pools hp JOIN buyer_demands d ON d.id = hp.demand_id
             WHERE d.buyer_id = ? ORDER BY hp.id DESC
         ''', (current_user.profile_id,)).fetchall()
+        demo_orders = db.execute("""SELECT o.*, d.crop, d.quantity_kg, d.delivery_location,
+                    (SELECT COUNT(*) FROM pool_contributions pc
+                     JOIN harvest_pools hp ON hp.id=pc.pool_id
+                     WHERE hp.demand_id=o.demand_id AND pc.offer_status='Accepted') AS accepted_count,
+                    (SELECT COUNT(*) FROM pool_contributions pc
+                     JOIN harvest_pools hp ON hp.id=pc.pool_id
+                     WHERE hp.demand_id=o.demand_id AND pc.offer_status='Accepted' AND pc.demo_ready=1) AS ready_count
+                    FROM demo_orders o JOIN buyer_demands d ON d.id=o.demand_id
+                    WHERE o.buyer_id=? ORDER BY o.id DESC""", (current_user.profile_id,)).fetchall()
         return render_template('index.html', my_listings=[], my_contributions=[],
                                my_demands=my_demands, market_listings=market_listings,
-                               my_pools=my_pools, summary=summary,
+                               my_pools=my_pools, summary=summary, demo_orders=demo_orders,
+                               demo_order_demand_ids={o['demand_id'] for o in demo_orders},
                                heritage_crops=HERITAGE_CROPS, heritage_check=is_heritage,
                                estimated_net=estimated_net)
     finally:
@@ -468,6 +494,10 @@ def match_supply(demand_id):
         if not demand:
             db.rollback()
             abort(404)
+        if db.execute('SELECT 1 FROM demo_orders WHERE demand_id=?', (demand_id,)).fetchone():
+            db.rollback()
+            flash('This request is already in the demo order workflow.', 'error')
+            return redirect(url_for('dashboard'))
         pool = db.execute('SELECT * FROM harvest_pools WHERE demand_id=?', (demand_id,)).fetchone()
         if pool:
             pool_id = pool['id']
@@ -542,6 +572,12 @@ def respond_to_offer(contribution_id, decision):
         if not offer:
             db.rollback()
             abort(404)
+        linked_order = db.execute('''SELECT 1 FROM demo_orders o JOIN harvest_pools hp
+            ON hp.demand_id=o.demand_id WHERE hp.id=?''', (offer['pool_id'],)).fetchone()
+        if linked_order:
+            db.rollback()
+            flash('This pool is already part of a demo order.', 'error')
+            return redirect(url_for('dashboard'))
         if offer['offer_status'] != 'Pending':
             db.rollback()
             flash('This offer has already been handled or belongs to an older test pool.', 'error')
@@ -573,6 +609,128 @@ def respond_to_offer(contribution_id, decision):
     flash(f'Offer {new_status.lower()}. Buyer request status updated.', 'success')
     return redirect(url_for('dashboard'))
 
+
+
+
+# PHASE 6: Simulated orders. Never take payment details or represent a demo
+# status as verified payment, delivery, escrow, or farmer payout.
+@app.post('/demo-orders/create/<int:demand_id>')
+@require_role('buyer')
+def create_demo_order(demand_id):
+    db = get_db()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        demand = db.execute('''SELECT * FROM buyer_demands
+            WHERE id=? AND buyer_id=?''', (demand_id, current_user.profile_id)).fetchone()
+        if demand is None:
+            db.rollback()
+            abort(404)
+        if db.execute('SELECT 1 FROM demo_orders WHERE demand_id=?', (demand_id,)).fetchone():
+            db.rollback()
+            flash('A demo order already exists for this request.', 'error')
+            return redirect(url_for('dashboard'))
+        pool = db.execute('SELECT * FROM harvest_pools WHERE demand_id=?', (demand_id,)).fetchone()
+        if pool is None:
+            db.rollback()
+            flash('Match supply and get farmer approvals first.', 'error')
+            return redirect(url_for('dashboard'))
+        rows = db.execute('''SELECT offer_status, quantity_kg FROM pool_contributions
+            WHERE pool_id=?''', (pool['id'],)).fetchall()
+        if (not rows or any(x['offer_status'] in ('Pending', 'Legacy reservation') for x in rows)
+                or sum(x['quantity_kg'] for x in rows if x['offer_status']=='Accepted')
+                    < demand['quantity_kg'] - 0.00001):
+            db.rollback()
+            flash('A demo order requires full accepted supply and no pending or legacy reservations.', 'error')
+            return redirect(url_for('dashboard'))
+        from decimal import Decimal, ROUND_HALF_UP
+        total = (Decimal(str(demand['quantity_kg'])) * Decimal(str(demand['target_price'])) * 100)
+        cents = int(total.quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+        db.execute('''INSERT INTO demo_orders(demand_id,buyer_id,total_kg,indicative_total_cents)
+            VALUES (?,?,?,?)''', (demand_id, current_user.profile_id, demand['quantity_kg'], cents))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    flash('Demo order created. This is an estimate, not an invoice or payment request.', 'success')
+    return redirect(url_for('dashboard'))
+
+
+@app.post('/demo-orders/<int:order_id>/mark-paid')
+@require_role('buyer')
+def demo_mark_paid(order_id):
+    db = get_db()
+    try:
+        with db:
+            changed = db.execute('''UPDATE demo_orders SET status='Demo payment marked',
+                updated_at=CURRENT_TIMESTAMP WHERE id=? AND buyer_id=?
+                AND status='Awaiting demo payment' ''',
+                (order_id, current_user.profile_id)).rowcount
+    finally:
+        db.close()
+    flash('Simulated payment recorded (no money moved).' if changed else 'This demo order cannot be marked paid.',
+          'success' if changed else 'error')
+    return redirect(url_for('dashboard'))
+
+
+@app.post('/demo-orders/<int:order_id>/ready/<int:contribution_id>')
+@require_role('farmer')
+def demo_mark_ready(order_id, contribution_id):
+    db = get_db()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        order = db.execute('''SELECT o.* FROM demo_orders o WHERE o.id=?''', (order_id,)).fetchone()
+        if not order:
+            db.rollback()
+            abort(404)
+        row = db.execute('''SELECT pc.id FROM pool_contributions pc
+            JOIN harvest_pools hp ON hp.id=pc.pool_id
+            WHERE pc.id=? AND pc.farmer_id=? AND pc.offer_status='Accepted'
+            AND hp.demand_id=?''', (contribution_id, current_user.profile_id,
+                                 order['demand_id'])).fetchone()
+        if not row:
+            db.rollback()
+            abort(404)
+        if order['status'] not in ('Demo payment marked','Ready for demo delivery'):
+            db.rollback()
+            flash('The buyer must mark demo payment before produce can be marked ready.', 'error')
+            return redirect(url_for('dashboard'))
+        db.execute('UPDATE pool_contributions SET demo_ready=1 WHERE id=?', (contribution_id,))
+        counts = db.execute('''SELECT COUNT(*) AS total,
+            SUM(CASE WHEN pc.demo_ready=1 THEN 1 ELSE 0 END) AS ready
+            FROM pool_contributions pc JOIN harvest_pools hp ON hp.id=pc.pool_id
+            WHERE hp.demand_id=? AND pc.offer_status='Accepted' ''',
+            (order['demand_id'],)).fetchone()
+        if counts['total'] > 0 and counts['total'] == counts['ready']:
+            db.execute('''UPDATE demo_orders SET status='Ready for demo delivery',
+                updated_at=CURRENT_TIMESTAMP WHERE id=?''', (order_id,))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    flash('Your contribution was marked ready (simulation only).', 'success')
+    return redirect(url_for('dashboard'))
+
+
+@app.post('/demo-orders/<int:order_id>/confirm-delivery')
+@require_role('buyer')
+def demo_confirm_delivery(order_id):
+    db = get_db()
+    try:
+        with db:
+            changed = db.execute('''UPDATE demo_orders SET status='Demo delivery confirmed',
+                updated_at=CURRENT_TIMESTAMP WHERE id=? AND buyer_id=?
+                AND status='Ready for demo delivery' ''',
+                (order_id, current_user.profile_id)).rowcount
+    finally:
+        db.close()
+    flash('Delivery marked complete in the demo (not independently verified).' if changed
+          else 'All farmer contributions must be marked ready first.',
+          'success' if changed else 'error')
+    return redirect(url_for('dashboard'))
 
 # Old routes were insecure: they cannot create unowned standalone profiles anymore.
 @app.post('/farmers/add')
