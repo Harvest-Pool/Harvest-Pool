@@ -1,0 +1,13 @@
+{% extends 'base.html' %}{% block content %}
+<section class="auth"><div class="kicker">JOIN HARVEST POOL</div><h1>Create an account</h1><p>Register as a farmer or buyer. Accounts are separate and protected.</p>
+<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label>Account type<select name="role" id="role" required><option value="farmer">Farmer</option><option value="buyer">Buyer</option></select></label>
+<label>Email<input name="email" type="email" maxlength="254" autocomplete="email" required></label>
+<label>Password (at least 12 characters)<input name="password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required></label>
+<label>Your full name / contact name<input name="name" maxlength="120" required></label>
+<label>Phone number<input name="phone" type="tel" maxlength="30" required></label>
+<label>Village or location<input name="place" maxlength="120" required></label>
+<div id="businessrow" hidden><label>Business name (buyers)<input name="business_name" id="business_name" maxlength="120"></label></div>
+<button type="submit">Create account</button></form><p>Already registered? <a href="{{ url_for('login') }}">Log in</a></p></section>
+<script>const r=document.getElementById('role'),b=document.getElementById('businessrow'),n=document.getElementById('business_name');function sync(){b.hidden=r.value!=='buyer';n.required=r.value==='buyer'}r.addEventListener('change',sync);sync()</script>
+{% endblock %}
