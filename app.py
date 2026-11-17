@@ -1,5 +1,5 @@
-"""Harvest Pool Phase 3: local demo with authenticated farmer/buyer roles.
-Not production ready: no payment handling, identity verification, or farmer consent workflow.
+"""Harvest Pool Phase 5: local demo of consent-led trading, price visibility, and IKS crop discovery.
+Not production ready. No live payments, identity verification, or community knowledge submissions.
 """
 import math
 import os
@@ -32,6 +32,22 @@ csrf = CSRFProtect(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 limiter = Limiter(key_func=get_remote_address, app=app, default_limits=[], storage_uri='memory://')
+# Public references only. Local/cultural names require community verification before publication.
+HERITAGE_CROPS = (
+    {'name': 'Amaranth', 'group': 'Traditional leafy vegetable',
+     'reference': 'Agricultural Research Council',
+     'url': 'https://www.arc.agric.za/arc-vopi/Pages/Crop%20Science/Indigenous-Crops.aspx'},
+    {'name': 'Cowpea Leaves', 'group': 'Traditional leafy vegetable',
+     'reference': 'Department of Agriculture',
+     'url': 'https://nda.gov.za/phocadownloadpap/Brochures_and_Production_Guidelines/Brochure%20Indigenous%20Food%20Crops%202010.pdf'},
+    {'name': 'Bambara Groundnut', 'group': 'Traditional pulse',
+     'reference': 'Department of Agriculture',
+     'url': 'https://nda.gov.za/phocadownloadpap/Brochures_and_Production_Guidelines/Brochure%20Indigenous%20Food%20Crops%202010.pdf'},
+    {'name': 'Spider Flower', 'group': 'Traditional leafy vegetable (Cleome)',
+     'reference': 'Agricultural Research Council',
+     'url': 'https://www.arc.agric.za/arc-vopi/Pages/Crop%20Science/Indigenous-Crops.aspx'},
+)
+HERITAGE_NAMES = {item['name'].casefold() for item in HERITAGE_CROPS}
 DATABASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'harvest_pool.db')
 
 
@@ -98,6 +114,17 @@ def init_db():
         columns = {row['name'] for row in db.execute('PRAGMA table_info(pool_contributions)')}
         if 'offer_status' not in columns:
             db.execute("ALTER TABLE pool_contributions ADD COLUMN offer_status TEXT NOT NULL DEFAULT 'Legacy reservation'")
+        # Add columns without dropping existing Phase 4 data.
+        listing_cols = {row['name'] for row in db.execute('PRAGMA table_info(produce_listings)')}
+        if 'asking_price' not in listing_cols:
+            db.execute('ALTER TABLE produce_listings ADD COLUMN asking_price REAL')
+        contribution_cols = {row['name'] for row in db.execute('PRAGMA table_info(pool_contributions)')}
+        if 'farmer_asking_price' not in contribution_cols:
+            db.execute('ALTER TABLE pool_contributions ADD COLUMN farmer_asking_price REAL')
+        if 'transport_cost' not in contribution_cols:
+            db.execute('ALTER TABLE pool_contributions ADD COLUMN transport_cost REAL')
+        if 'packaging_cost' not in contribution_cols:
+            db.execute('ALTER TABLE pool_contributions ADD COLUMN packaging_cost REAL')
         # A profile can only be owned by one account within its role.
         db.execute('''CREATE UNIQUE INDEX IF NOT EXISTS unique_user_profile
                       ON users(role, profile_id) WHERE profile_id IS NOT NULL''')
@@ -151,6 +178,22 @@ def positive_number(value):
         return n if n > 0 and math.isfinite(n) else None
     except (TypeError, ValueError):
         return None
+
+
+def nonnegative_money(value):
+    try:
+        n = float(value)
+        return n if math.isfinite(n) and 0 <= n <= 1_000_000 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def is_heritage(crop):
+    return str(crop).strip().casefold() in HERITAGE_NAMES
+
+
+def estimated_net(price_per_kg, kg, transport, packaging):
+    return round(price_per_kg * kg - transport - packaging, 2)
 
 
 def parse_date(value):
@@ -250,7 +293,8 @@ def dashboard():
             my_listings = db.execute('''SELECT * FROM produce_listings WHERE farmer_id = ?
                                         ORDER BY id DESC''', (current_user.profile_id,)).fetchall()
             my_contributions = db.execute('''
-                SELECT pc.id, pc.quantity_kg, pc.indicative_price, pc.offer_status, p.crop, hp.status,
+                SELECT pc.id, pc.quantity_kg, pc.indicative_price, pc.offer_status,
+                       pc.farmer_asking_price, pc.transport_cost, pc.packaging_cost, p.crop, hp.status,
                        b.business_name
                 FROM pool_contributions pc
                 JOIN produce_listings p ON p.id = pc.listing_id
@@ -261,11 +305,13 @@ def dashboard():
             ''', (current_user.profile_id,)).fetchall()
             return render_template('index.html', my_listings=my_listings,
                                    my_contributions=my_contributions,
-                                   my_demands=[], market_listings=[], my_pools=[])
+                                   my_demands=[], market_listings=[], my_pools=[],
+                                   heritage_crops=HERITAGE_CROPS, heritage_check=is_heritage,
+                                   estimated_net=estimated_net)
         my_demands = db.execute('''SELECT * FROM buyer_demands WHERE buyer_id = ?
                                    ORDER BY id DESC''', (current_user.profile_id,)).fetchall()
         market_listings = db.execute('''
-            SELECT p.id, p.crop, p.available_kg, p.quality, p.harvest_date,
+            SELECT p.id, p.crop, p.available_kg, p.asking_price, p.quality, p.harvest_date,
                    f.village
             FROM produce_listings p JOIN farmers f ON f.id = p.farmer_id
             WHERE p.available_kg > 0 ORDER BY p.id DESC
@@ -289,7 +335,9 @@ def dashboard():
         ''', (current_user.profile_id,)).fetchall()
         return render_template('index.html', my_listings=[], my_contributions=[],
                                my_demands=my_demands, market_listings=market_listings,
-                               my_pools=my_pools, summary=summary)
+                               my_pools=my_pools, summary=summary,
+                               heritage_crops=HERITAGE_CROPS, heritage_check=is_heritage,
+                               estimated_net=estimated_net)
     finally:
         db.close()
 
@@ -301,6 +349,10 @@ def add_produce():
     qty = positive_number(request.form.get('quantity_kg'))
     harvested = request.form.get('harvest_date', '')
     quality = request.form.get('quality', '')
+    asking = positive_number(request.form.get('asking_price'))
+    if not asking or asking > 1_000_000:
+        flash('Enter a valid asking price per kg.', 'error')
+        return redirect(url_for('dashboard'))
     if not crop or len(crop) > 100 or not qty or not parse_date(harvested) or quality not in ('Grade A', 'Grade B', 'Mixed'):
         flash('Complete valid produce details.', 'error')
         return redirect(url_for('dashboard'))
@@ -308,12 +360,46 @@ def add_produce():
     try:
         with db:
             db.execute('''INSERT INTO produce_listings
-                (farmer_id, crop, quantity_kg, available_kg, harvest_date, quality)
-                VALUES (?, ?, ?, ?, ?, ?)''',
-                (current_user.profile_id, crop, qty, qty, harvested, quality))
+                (farmer_id, crop, quantity_kg, available_kg, harvest_date, quality, asking_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                (current_user.profile_id, crop, qty, qty, harvested, quality, asking))
     finally:
         db.close()
     flash('Your produce was listed.', 'success')
+    return redirect(url_for('dashboard'))
+
+
+@app.post('/produce/<int:listing_id>/asking-price')
+@require_role('farmer')
+def set_asking_price(listing_id):
+    """Add/edit an asking price; existing offers keep their original snapshot."""
+    price = positive_number(request.form.get('asking_price'))
+    if price is None or price > 1_000_000:
+        flash('Enter a valid asking price per kg.', 'error')
+        return redirect(url_for('dashboard'))
+    db = get_db()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        listing = db.execute('SELECT id FROM produce_listings WHERE id=? AND farmer_id=?',
+                             (listing_id, current_user.profile_id)).fetchone()
+        if not listing:
+            db.rollback()
+            abort(404)
+        pending = db.execute("SELECT COUNT(*) FROM pool_contributions WHERE listing_id=? AND offer_status='Pending'",
+                             (listing_id,)).fetchone()[0]
+        if pending:
+            db.rollback()
+            flash('Resolve pending offers before changing this listing price.', 'error')
+            return redirect(url_for('dashboard'))
+        db.execute('UPDATE produce_listings SET asking_price=? WHERE id=? AND farmer_id=?',
+                   (price, listing_id, current_user.profile_id))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    flash('Your asking price was updated for future offers.', 'success')
     return redirect(url_for('dashboard'))
 
 
@@ -407,8 +493,9 @@ def match_supply(demand_id):
                           WHERE pc.listing_id=p.id AND pc.offer_status='Pending'),0) AS pending_kg
                 FROM produce_listings p
                 WHERE LOWER(p.crop)=LOWER(?) AND p.available_kg > 0 AND p.harvest_date <= ?
-                ORDER BY p.harvest_date, p.id''',
-                (demand['crop'], demand['deadline'])).fetchall()
+                  AND p.asking_price IS NOT NULL AND p.asking_price <= ?
+                ORDER BY p.asking_price ASC, p.harvest_date ASC, p.id ASC''',
+                (demand['crop'], demand['deadline'], demand['target_price'])).fetchall()
             for listing in listings:
                 if remaining <= 0.00001:
                     break
@@ -417,9 +504,9 @@ def match_supply(demand_id):
                 if amount <= 0:
                     continue
                 db.execute('''INSERT INTO pool_contributions
-                    (pool_id, listing_id, farmer_id, quantity_kg, indicative_price, offer_status)
-                    VALUES (?, ?, ?, ?, ?, 'Pending')''',
-                    (pool_id, listing['id'], listing['farmer_id'], amount, demand['target_price']))
+                    (pool_id, listing_id, farmer_id, quantity_kg, indicative_price, farmer_asking_price, offer_status)
+                    VALUES (?, ?, ?, ?, ?, ?, 'Pending')''',
+                    (pool_id, listing['id'], listing['farmer_id'], amount, demand['target_price'], listing['asking_price']))
                 created += 1
                 remaining -= amount
         status = recalculate_pool(db, pool_id)
@@ -429,7 +516,7 @@ def match_supply(demand_id):
         raise
     finally:
         db.close()
-    flash(f'{created} farmer offer(s) proposed. Status: {status}. No stock has been deducted. '
+    flash(f'{created} price-compatible farmer offer(s) proposed. Status: {status}. No stock has been deducted. '
           'Farmers must accept before supply is allocated.', 'success')
     return redirect(url_for('dashboard'))
 
@@ -439,6 +526,11 @@ def match_supply(demand_id):
 def respond_to_offer(contribution_id, decision):
     if decision not in ('accept', 'reject'):
         abort(404)
+    transport = nonnegative_money(request.form.get('transport_cost')) if decision == 'accept' else 0
+    packaging = nonnegative_money(request.form.get('packaging_cost')) if decision == 'accept' else 0
+    if transport is None or packaging is None:
+        flash('Enter valid non-negative estimated costs.', 'error')
+        return redirect(url_for('dashboard'))
     db = get_db()
     try:
         db.execute('BEGIN IMMEDIATE')
@@ -467,8 +559,10 @@ def respond_to_offer(contribution_id, decision):
             new_status = 'Accepted'
         else:
             new_status = 'Rejected'
-        db.execute('UPDATE pool_contributions SET offer_status=? WHERE id=?',
-                   (new_status, contribution_id))
+        db.execute('''UPDATE pool_contributions
+            SET offer_status=?, transport_cost=?, packaging_cost=? WHERE id=?''',
+            (new_status, transport if new_status == 'Accepted' else None,
+             packaging if new_status == 'Accepted' else None, contribution_id))
         recalculate_pool(db, offer['pool_id'])
         db.commit()
     except Exception:
