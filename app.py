@@ -236,6 +236,36 @@ def init_db():
             source TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""")
+        # Phase 12: test-only settlement allocation snapshots. No bank details,
+        # no payouts, no real debts or balances are created by these records.
+        db.execute("""CREATE TABLE IF NOT EXISTS test_settlement_allocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payment_id INTEGER NOT NULL REFERENCES paystack_test_payments(id),
+            order_allocation_id INTEGER NOT NULL REFERENCES order_farmer_allocations(id),
+            order_id INTEGER NOT NULL REFERENCES demo_orders(id),
+            farmer_id INTEGER NOT NULL REFERENCES farmers(id),
+            gross_cents INTEGER NOT NULL CHECK(gross_cents >= 0),
+            platform_fee_cents INTEGER NOT NULL DEFAULT 0 CHECK(platform_fee_cents >= 0),
+            net_test_cents INTEGER NOT NULL CHECK(net_test_cents >= 0),
+            record_kind TEXT NOT NULL DEFAULT 'TEST_ONLY',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(payment_id, order_allocation_id)
+        )""")
+        db.execute('CREATE INDEX IF NOT EXISTS idx_test_settlement_farmer ON test_settlement_allocations(farmer_id, id)')
+        # Backfill only precisely reconciled, Paystack-verified historical TEST orders.
+        # These are illustrative allocation snapshots, never proof of settlement.
+        db.execute("""INSERT OR IGNORE INTO test_settlement_allocations
+            (payment_id, order_allocation_id, order_id, farmer_id,
+             gross_cents, platform_fee_cents, net_test_cents)
+            SELECT p.id,a.id,a.order_id,a.farmer_id,a.gross_cents,0,a.gross_cents
+            FROM paystack_test_payments p
+            JOIN order_farmer_allocations a ON a.order_id=p.order_id
+            JOIN demo_orders o ON o.id=p.order_id
+            WHERE p.status='verified_test' AND p.currency='ZAR'
+              AND p.expected_amount_cents=o.indicative_total_cents
+              AND (SELECT COALESCE(SUM(a2.gross_cents),0)
+                   FROM order_farmer_allocations a2 WHERE a2.order_id=o.id)=o.indicative_total_cents
+        """)
         db.commit()
     finally:
         db.close()
@@ -607,7 +637,16 @@ def dashboard():
                 LEFT JOIN demo_orders o ON o.demand_id = d.id
                 WHERE pc.farmer_id = ? ORDER BY pc.id DESC
             ''', (current_user.profile_id,)).fetchall()
-            return render_template('index.html', my_listings=my_listings, today=date.today().isoformat(),
+            settlement_rows = db.execute('''SELECT t.*, o.id AS order_number, d.crop,
+                p.reference, p.verified_at
+                FROM test_settlement_allocations t
+                JOIN demo_orders o ON o.id=t.order_id
+                JOIN buyer_demands d ON d.id=o.demand_id
+                JOIN paystack_test_payments p ON p.id=t.payment_id
+                WHERE t.farmer_id=? ORDER BY t.id DESC LIMIT 30''',
+                (current_user.profile_id,)).fetchall()
+            return render_template('index.html', settlement_rows=settlement_rows,
+                                   my_listings=my_listings, today=date.today().isoformat(),
                                    my_contributions=my_contributions, seller_verification=farmer_profile['verification_status'],
                                    my_demands=[], market_listings=[], my_pools=[], demo_orders=[],
                                    heritage_crops=HERITAGE_CROPS, heritage_check=is_heritage,
@@ -646,7 +685,13 @@ def dashboard():
                      WHERE hp.demand_id=o.demand_id AND pc.offer_status='Accepted' AND pc.demo_ready=1) AS ready_count
                     FROM demo_orders o JOIN buyer_demands d ON d.id=o.demand_id
                     WHERE o.buyer_id=? ORDER BY o.id DESC""", (current_user.profile_id,)).fetchall()
-        return render_template('index.html', my_listings=[], my_contributions=[],
+        verified_orders = db.execute('''SELECT p.order_id, p.reference, p.verified_at,
+            p.expected_amount_cents FROM paystack_test_payments p
+            JOIN demo_orders o ON o.id=p.order_id
+            WHERE o.buyer_id=? AND p.status='verified_test'
+            ORDER BY p.id DESC LIMIT 50''', (current_user.profile_id,)).fetchall()
+        return render_template('index.html', verified_orders=verified_orders,
+                               my_listings=[], my_contributions=[],
                                my_demands=my_demands, market_listings=market_listings, today=date.today().isoformat(),
                                my_pools=my_pools, summary=summary, demo_orders=demo_orders,
                                demo_order_demand_ids={o['demand_id'] for o in demo_orders},
@@ -1046,10 +1091,17 @@ def order_allocations_detail(order_id):
                 FROM order_farmer_allocations a JOIN farmers f ON f.id=a.farmer_id
                 JOIN pool_contributions pc ON pc.id=a.contribution_id
                 WHERE a.order_id=? ORDER BY a.id""", (order_id,)).fetchall()
+        settlement_rows = db.execute('''SELECT t.*,f.name AS farmer_name
+            FROM test_settlement_allocations t
+            JOIN farmers f ON f.id=t.farmer_id
+            WHERE t.order_id=? AND (?='buyer' OR ?='admin' OR t.farmer_id=?)
+            ORDER BY t.id''', (order_id,current_user.role,current_user.role,
+                               current_user.profile_id or -1)).fetchall()
         full_sum = db.execute('SELECT COALESCE(SUM(gross_cents),0) FROM order_farmer_allocations WHERE order_id=?',
                               (order_id,)).fetchone()[0]
         payment = db.execute('SELECT * FROM paystack_test_payments WHERE order_id=? ORDER BY id DESC LIMIT 1', (order_id,)).fetchone() if current_user.role == 'buyer' else None
-        return render_template('order_allocations.html', order=order, allocations=rows,
+        return render_template('order_allocations.html', settlement_rows=settlement_rows,
+                               order=order, allocations=rows,
                                paystack_payment=payment,
                                allocated_total_cents=full_sum,
                                reconciled=bool(rows) and full_sum==order['indicative_total_cents'],
@@ -1214,6 +1266,12 @@ def apply_verified_test_payment(reference, verification, source):
                 WHERE id=?""", (str(verification.get('id', '')), amount, 'ZAR', p['id']))
             db.execute('INSERT INTO paystack_test_events(payment_id,event_type,provider_status,source) VALUES(?,?,?,?)',
                        (p['id'], 'verification', 'success', source))
+            db.execute("""INSERT OR IGNORE INTO test_settlement_allocations
+                (payment_id, order_allocation_id, order_id, farmer_id,
+                 gross_cents, platform_fee_cents, net_test_cents)
+                SELECT ?,a.id,a.order_id,a.farmer_id,a.gross_cents,0,a.gross_cents
+                FROM order_farmer_allocations a WHERE a.order_id=?""",
+                (p['id'], p['order_id']))
             db.commit()
             return 'verified_test'
         if reference_ok and domain_ok and verification.get('status') in ('failed','abandoned','reversed'):
@@ -1487,12 +1545,25 @@ def admin_dashboard():
           FROM farmers f LEFT JOIN produce_listings p ON p.farmer_id=f.id
           GROUP BY f.id ORDER BY CASE f.verification_status
               WHEN 'Pending' THEN 0 WHEN 'Suspended' THEN 1 ELSE 2 END,f.id DESC''').fetchall()
+        test_finance = db.execute('''SELECT COUNT(DISTINCT p.id) AS payments,
+            COALESCE(SUM(a.gross_cents),0) AS allocated_cents,
+            COUNT(a.id) AS seller_allocations
+            FROM paystack_test_payments p
+            LEFT JOIN test_settlement_allocations a ON a.payment_id=p.id
+            WHERE p.status='verified_test' ''').fetchone()
+        test_finance_rows = db.execute('''SELECT t.id,t.order_id,t.gross_cents,
+            f.name AS farmer_name,p.reference,p.verified_at
+            FROM test_settlement_allocations t
+            JOIN farmers f ON f.id=t.farmer_id
+            JOIN paystack_test_payments p ON p.id=t.payment_id
+            ORDER BY t.id DESC LIMIT 40''').fetchall()
         events = db.execute('''SELECT e.*,f.name AS farmer_name,a.email AS admin_email
           FROM seller_review_events e JOIN farmers f ON f.id=e.farmer_id
           JOIN admin_accounts a ON a.id=e.admin_id ORDER BY e.id DESC LIMIT 40''').fetchall()
     finally:
         db.close()
-    return render_template('admin_dashboard.html',farmers=farmers,events=events)
+    return render_template('admin_dashboard.html',farmers=farmers,events=events,
+                           test_finance=test_finance,test_finance_rows=test_finance_rows)
 
 
 @app.post('/admin/sellers/<int:farmer_id>/review')
