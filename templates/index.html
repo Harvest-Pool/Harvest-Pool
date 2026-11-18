@@ -43,6 +43,9 @@
 <div class="table-wrap"><table><thead><tr><th>Order</th><th>Crop</th><th>Indicative total</th><th>Farmer contributions ready</th><th>Status</th><th>Next demo action</th></tr></thead><tbody>
 {% for o in demo_orders %}<tr><td><a href="{{ url_for('order_allocations_detail',order_id=o.id) }}">#{{ o.id }} · Breakdown</a></td><td>{{ o.crop }}</td><td>R{{ '%.2f'|format(o.indicative_total_cents / 100) }}</td><td>{{ o.ready_count }} / {{ o.accepted_count }}</td><td>{{ o.status }}</td><td>
 {% if o.status == 'Awaiting demo payment' %}<form method="post" action="{{ url_for('demo_mark_paid', order_id=o.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="small" type="submit">Simulate payment</button></form>
+<a href="{{ url_for('order_allocations_detail', order_id=o.id) }}">
+    Continue to secure test checkout
+</a>
 {% elif o.status == 'Ready for demo delivery' %}<form method="post" action="{{ url_for('demo_confirm_delivery', order_id=o.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="small" type="submit">Confirm demo delivery</button></form>
 {% else %}—{% endif %}</td></tr>{% else %}<tr><td colspan="6">No demo orders. First obtain full farmer-approved supply.</td></tr>{% endfor %}</tbody></table></div></section>
 {% endif %}

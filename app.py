@@ -2,6 +2,13 @@
 Not production ready. No live payments, identity verification, or community knowledge submissions.
 """
 import math
+import hmac
+import hashlib
+import time
+import logging
+import json
+import requests
+from urllib.parse import quote, urlparse
 import io
 import secrets
 from pathlib import Path
@@ -14,7 +21,7 @@ from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 from functools import wraps
 
 from dotenv import load_dotenv
-from flask import Flask, abort, flash, redirect, render_template, request, url_for, send_from_directory
+from flask import Flask, abort, flash, redirect, render_template, request, url_for, send_from_directory, jsonify
 from flask_login import LoginManager, UserMixin, current_user, login_required, login_user, logout_user
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -200,6 +207,35 @@ def init_db():
         # A profile can only be owned by one account within its role.
         db.execute('''CREATE UNIQUE INDEX IF NOT EXISTS unique_user_profile
                       ON users(role, profile_id) WHERE profile_id IS NOT NULL''')
+        # Phase 11: additional test-provider records only; never alter historic orders.
+        db.execute("""CREATE TABLE IF NOT EXISTS paystack_test_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL REFERENCES demo_orders(id),
+            reference TEXT NOT NULL UNIQUE,
+            expected_amount_cents INTEGER NOT NULL CHECK(expected_amount_cents > 0),
+            currency TEXT NOT NULL DEFAULT 'ZAR' CHECK(currency='ZAR'),
+            status TEXT NOT NULL DEFAULT 'initializing' CHECK(status IN
+                ('initializing','pending','verified_test','failed','review_required')),
+            authorization_url TEXT,
+            provider_transaction_id TEXT,
+            provider_amount_cents INTEGER,
+            provider_currency TEXT,
+            verified_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_paystack_paid_order
+            ON paystack_test_payments(order_id) WHERE status='verified_test'""")
+        db.execute("""CREATE INDEX IF NOT EXISTS idx_paystack_order
+            ON paystack_test_payments(order_id, id)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS paystack_test_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payment_id INTEGER NOT NULL REFERENCES paystack_test_payments(id),
+            event_type TEXT NOT NULL,
+            provider_status TEXT,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
         db.commit()
     finally:
         db.close()
@@ -1012,7 +1048,9 @@ def order_allocations_detail(order_id):
                 WHERE a.order_id=? ORDER BY a.id""", (order_id,)).fetchall()
         full_sum = db.execute('SELECT COALESCE(SUM(gross_cents),0) FROM order_farmer_allocations WHERE order_id=?',
                               (order_id,)).fetchone()[0]
+        payment = db.execute('SELECT * FROM paystack_test_payments WHERE order_id=? ORDER BY id DESC LIMIT 1', (order_id,)).fetchone() if current_user.role == 'buyer' else None
         return render_template('order_allocations.html', order=order, allocations=rows,
+                               paystack_payment=payment,
                                allocated_total_cents=full_sum,
                                reconciled=bool(rows) and full_sum==order['indicative_total_cents'],
                                viewing_farmer=current_user.role=='farmer')
@@ -1026,6 +1064,9 @@ def demo_mark_paid(order_id):
     db = get_db()
     try:
         with db:
+            if db.execute('SELECT 1 FROM paystack_test_payments WHERE order_id=? AND status IN ("initializing","pending","verified_test")', (order_id,)).fetchone():
+                flash('A Paystack test checkout exists for this order. Do not use the old demo-payment button.', 'error')
+                return redirect(url_for('dashboard'))
             changed = db.execute('''UPDATE demo_orders SET status='Demo payment marked',
                 updated_at=CURRENT_TIMESTAMP WHERE id=? AND buyer_id=?
                 AND status='Awaiting demo payment' ''',
@@ -1094,6 +1135,291 @@ def demo_confirm_delivery(order_id):
           else 'All farmer contributions must be marked ready first.',
           'success' if changed else 'error')
     return redirect(url_for('dashboard'))
+
+
+# --------------------------------------------------------------
+# PHASE 11: Paystack TEST-only hosted checkout (no live payments).
+# Does NOT claim to distribute money to any farmers.
+# --------------------------------------------------------------
+PAYSTACK_API = 'https://api.paystack.co'
+
+
+def paystack_test_key():
+    key = os.environ.get('PAYSTACK_SECRET_KEY', '').strip()
+    if not key.startswith('sk_test_'):
+        return None
+    return key
+
+
+def provider_request(method, endpoint, payload=None):
+    """Only communicate with Paystack's fixed HTTPS API. No arbitrary URLs."""
+    key = paystack_test_key()
+    if not key:
+        raise RuntimeError('Paystack TEST secret key is not configured')
+    if not endpoint.startswith('/transaction/'):
+        raise ValueError('Unsupported Paystack endpoint')
+    response = requests.request(
+        method, PAYSTACK_API + endpoint,
+        headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'},
+        json=payload, timeout=(5, 15), allow_redirects=False,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if data.get('status') is not True or not isinstance(data.get('data'), dict):
+        raise RuntimeError('Paystack returned an unsuccessful API response')
+    return data['data']
+
+
+def validate_checkout_link(url):
+    parsed = urlparse(url)
+    return (parsed.scheme == 'https' and parsed.hostname == 'checkout.paystack.com'
+            and parsed.port is None and not parsed.username and not parsed.password)
+
+
+def apply_verified_test_payment(reference, verification, source):
+    """Lock + validate reference, amount, currency, domain, status, then update once."""
+    db = get_db()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        p = db.execute('SELECT * FROM paystack_test_payments WHERE reference=?', (reference,)).fetchone()
+        if p is None:
+            db.rollback()
+            return 'unknown_reference'
+        if p['status'] == 'verified_test':
+            db.commit()
+            return 'already_verified'
+        order = db.execute('SELECT * FROM demo_orders WHERE id=?', (p['order_id'],)).fetchone()
+        gross = db.execute('SELECT COALESCE(SUM(gross_cents),0) FROM order_farmer_allocations WHERE order_id=?',
+                           (p['order_id'],)).fetchone()[0]
+        # Use exact integer comparison; explicitly require Paystack test domain.
+        reference_ok = verification.get('reference') == reference
+        amount = verification.get('amount')
+        amount_ok = isinstance(amount, int) and not isinstance(amount, bool) and amount == p['expected_amount_cents']
+        currency_ok = verification.get('currency') == 'ZAR'
+        domain_ok = verification.get('domain') == 'test'
+        payment_ok = verification.get('status') == 'success'
+        order_ok = (order is not None and order['status'] == 'Awaiting demo payment' and
+                    order['indicative_total_cents'] == p['expected_amount_cents'] and gross == p['expected_amount_cents'] and gross > 0)
+        matches = all((reference_ok, amount_ok, currency_ok, domain_ok, payment_ok, order_ok))
+        if matches:
+            other = db.execute("SELECT 1 FROM paystack_test_payments WHERE order_id=? AND status='verified_test'",
+                               (p['order_id'],)).fetchone()
+            if other:
+                db.execute("UPDATE paystack_test_payments SET status='review_required', updated_at=CURRENT_TIMESTAMP WHERE id=?", (p['id'],))
+                db.commit()
+                return 'review_required'
+            db.execute("""UPDATE paystack_test_payments
+                SET status='verified_test', provider_transaction_id=?, provider_amount_cents=?,
+                    provider_currency=?, verified_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                WHERE id=?""", (str(verification.get('id', '')), amount, 'ZAR', p['id']))
+            db.execute('INSERT INTO paystack_test_events(payment_id,event_type,provider_status,source) VALUES(?,?,?,?)',
+                       (p['id'], 'verification', 'success', source))
+            db.commit()
+            return 'verified_test'
+        if reference_ok and domain_ok and verification.get('status') in ('failed','abandoned','reversed'):
+            db.execute("UPDATE paystack_test_payments SET status='failed', updated_at=CURRENT_TIMESTAMP WHERE id=?", (p['id'],))
+            db.execute('INSERT INTO paystack_test_events(payment_id,event_type,provider_status,source) VALUES(?,?,?,?)',
+                       (p['id'], 'verification', str(verification.get('status')), source))
+            db.commit()
+            return 'failed'
+        # On incomplete/pending verify, don't mistakenly claim paid. A success
+        # with mismatched amount / currency is flagged for manual review.
+        if verification.get('status') == 'success':
+            db.execute("UPDATE paystack_test_payments SET status='review_required', updated_at=CURRENT_TIMESTAMP WHERE id=?", (p['id'],))
+            db.execute('INSERT INTO paystack_test_events(payment_id,event_type,provider_status,source) VALUES(?,?,?,?)',
+                       (p['id'], 'mismatch', 'success', source))
+            db.commit()
+            return 'review_required'
+        db.commit()
+        return 'pending'
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def verify_reference(reference, source):
+    if not re.fullmatch(r'HP11-[0-9]+-[a-f0-9]{32}', reference):
+        return 'invalid_reference'
+    data = provider_request('GET', '/transaction/verify/' + quote(reference, safe=''))
+    return apply_verified_test_payment(reference, data, source)
+
+
+def verify_paystack_webhook_signature(raw):
+    """Prefer timestamped Paystack-Signature (2026); legacy header fallback."""
+    header = request.headers.get('Paystack-Signature', '')
+    signing_secret = os.environ.get('PAYSTACK_WEBHOOK_SECRET', '').strip()
+    if header:
+        if not signing_secret.startswith('whsec_'):
+            return False
+        fields = [chunk.strip() for chunk in header.split(',')]
+        timestamps = [part[2:] for part in fields if part.startswith('t=')]
+        signatures = [part[3:] for part in fields if part.startswith('v1=')]
+        if len(timestamps) != 1 or not timestamps[0].isdigit() or abs(time.time()-int(timestamps[0])) > 300:
+            return False
+        digest = hmac.new(signing_secret.encode(), timestamps[0].encode()+b'.'+raw, hashlib.sha512).hexdigest()
+        return any(entry.startswith('whk_') and ':' in entry and re.fullmatch(r'[a-f0-9]{128}', entry.split(':',1)[1])
+                   and hmac.compare_digest(digest, entry.split(':',1)[1]) for entry in signatures)
+    legacy = request.headers.get('x-paystack-signature', '')
+    key = paystack_test_key()
+    if not key or not re.fullmatch(r'[a-f0-9]{128}', legacy):
+        return False
+    digest = hmac.new(key.encode(), raw, hashlib.sha512).hexdigest()
+    return hmac.compare_digest(digest, legacy)
+
+
+@app.post('/payments/paystack/test/<int:order_id>/start')
+@require_role('buyer')
+@limiter.limit('5 per minute')
+def paystack_start_test(order_id):
+    if not paystack_test_key():
+        flash('Configure a Paystack sk_test_ key first. Live keys are refused.', 'error')
+        return redirect(url_for('order_allocations_detail', order_id=order_id))
+    db = get_db()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        order = db.execute('SELECT * FROM demo_orders WHERE id=? AND buyer_id=?',
+                           (order_id, current_user.profile_id)).fetchone()
+        if order is None:
+            db.rollback()
+            abort(404)
+        if order['status'] != 'Awaiting demo payment':
+            db.rollback()
+            flash('Only an unpaid order can start a test checkout.', 'error')
+            return redirect(url_for('order_allocations_detail', order_id=order_id))
+        amount = order['indicative_total_cents']
+        summed = db.execute('SELECT COALESCE(SUM(gross_cents),0) FROM order_farmer_allocations WHERE order_id=?',
+                            (order_id,)).fetchone()[0]
+        if summed != amount or amount <= 0:
+            db.rollback()
+            flash('Order allocations do not reconcile; payment is blocked.', 'error')
+            return redirect(url_for('order_allocations_detail', order_id=order_id))
+        existing = db.execute("""SELECT * FROM paystack_test_payments WHERE order_id=?
+            AND status IN ('initializing','pending','verified_test','review_required') ORDER BY id DESC LIMIT 1""",
+                              (order_id,)).fetchone()
+        if existing:
+            db.commit()
+            if existing['status'] == 'pending' and existing['authorization_url'] and validate_checkout_link(existing['authorization_url']):
+                return redirect(existing['authorization_url'], code=303)
+            flash('An earlier checkout already exists. Check its result instead of creating a duplicate.', 'error')
+            return redirect(url_for('order_allocations_detail', order_id=order_id))
+        ref = f'HP11-{order_id}-{secrets.token_hex(16)}'
+        db.execute("""INSERT INTO paystack_test_payments(order_id,reference,expected_amount_cents,currency)
+                      VALUES(?,?,?,?)""", (order_id,ref,amount,'ZAR'))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    try:
+        callback = url_for('paystack_callback_test', _external=True)
+        provider = provider_request('POST','/transaction/initialize', {
+            'email': current_user.email, 'amount': str(amount), 'currency': 'ZAR',
+            'reference': ref, 'callback_url': callback,
+            'metadata': json.dumps({'harvest_pool_order_id': order_id, 'integration': 'sandbox_only'}),
+        })
+        url = provider.get('authorization_url', '')
+        if provider.get('reference') != ref or not validate_checkout_link(url):
+            raise ValueError('Unsafe or unexpected checkout response')
+        db = get_db()
+        try:
+            with db:
+                db.execute("""UPDATE paystack_test_payments SET status='pending', authorization_url=?,
+                      updated_at=CURRENT_TIMESTAMP WHERE reference=? AND status='initializing'""",(url,ref))
+        finally:
+            db.close()
+        return redirect(url, code=303)
+    except (requests.RequestException, ValueError, RuntimeError, KeyError) as exc:
+        app.logger.warning('Paystack test initialize failed: %s', type(exc).__name__)
+        db = get_db()
+        try:
+            with db:
+                db.execute("UPDATE paystack_test_payments SET status='review_required' WHERE reference=? AND status='initializing'", (ref,))
+        finally:
+            db.close()
+        flash('Checkout could not start. No payment is confirmed. Contact the administrator before retrying.', 'error')
+        return redirect(url_for('order_allocations_detail', order_id=order_id))
+
+
+@app.get('/payments/paystack/test/callback')
+@login_required
+def paystack_callback_test():
+    # Callback query parameters are NEVER accepted as proof of payment.
+    reference = request.args.get('reference', '')
+    db = get_db()
+    try:
+        p = db.execute('SELECT p.*, o.buyer_id FROM paystack_test_payments p JOIN demo_orders o ON o.id=p.order_id WHERE p.reference=?',
+                       (reference,)).fetchone()
+    finally:
+        db.close()
+    if p is None or current_user.role != 'buyer' or p['buyer_id'] != current_user.profile_id:
+        abort(404)
+    try:
+        result = verify_reference(reference,'callback')
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        app.logger.warning('Paystack test callback verification unavailable: %s', type(exc).__name__)
+        result = 'pending'
+    flash('Paystack TEST verification: ' + result.replace('_',' ') + '. No farmer payout occurred.',
+          'success' if result in ('verified_test','already_verified') else 'error')
+    return redirect(url_for('order_allocations_detail', order_id=p['order_id']))
+
+
+@app.post('/payments/paystack/test/<int:order_id>/check')
+@require_role('buyer')
+@limiter.limit('10 per minute')
+def paystack_check_test(order_id):
+    db=get_db()
+    try:
+        order=db.execute('SELECT 1 FROM demo_orders WHERE id=? AND buyer_id=?',(order_id,current_user.profile_id)).fetchone()
+        if not order:
+            abort(404)
+        p=db.execute('SELECT reference FROM paystack_test_payments WHERE order_id=? ORDER BY id DESC LIMIT 1',(order_id,)).fetchone()
+    finally:
+        db.close()
+    if not p:
+        abort(404)
+    try:
+        result=verify_reference(p['reference'],'manual_check')
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        app.logger.warning('Paystack verification unavailable: %s', type(exc).__name__)
+        result='verification_unavailable'
+    flash('Paystack TEST status: '+result.replace('_',' ')+'.',
+          'success' if result in ('verified_test','already_verified') else 'error')
+    return redirect(url_for('order_allocations_detail', order_id=order_id))
+
+
+@app.post('/payments/paystack/test/webhook')
+@csrf.exempt
+@limiter.limit('60 per minute')
+def paystack_webhook_test():
+    raw=request.get_data(cache=True)
+    if len(raw)>128*1024 or not verify_paystack_webhook_signature(raw):
+        abort(401)
+    event=request.get_json(silent=True)
+    if not isinstance(event,dict):
+        abort(400)
+    if event.get('event')!='charge.success':
+        return '',200
+    payload=event.get('data')
+    if not isinstance(payload,dict) or not isinstance(payload.get('reference'),str):
+        abort(400)
+    reference=payload['reference']
+    # Verify independently with Paystack's API; never trust posted success alone.
+    db=get_db()
+    try:
+        known=db.execute('SELECT id FROM paystack_test_payments WHERE reference=?',(reference,)).fetchone()
+    finally:
+        db.close()
+    if not known:
+        return '',200
+    try:
+        verify_reference(reference,'webhook')
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        app.logger.warning('Paystack test webhook verification failed: %s', type(exc).__name__)
+        return '',503  # Provider retries; do not acknowledge an unverified success.
+    return '',200
 
 # Old routes were insecure: they cannot create unowned standalone profiles anymore.
 @app.post('/farmers/add')
