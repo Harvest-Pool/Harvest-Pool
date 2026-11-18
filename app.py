@@ -2,14 +2,18 @@
 Not production ready. No live payments, identity verification, or community knowledge submissions.
 """
 import math
+import io
+import secrets
+from pathlib import Path
+from PIL import Image, ImageOps, UnidentifiedImageError
 import os
 import re
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import wraps
 
 from dotenv import load_dotenv
-from flask import Flask, abort, flash, redirect, render_template, request, url_for
+from flask import Flask, abort, flash, redirect, render_template, request, url_for, send_from_directory
 from flask_login import LoginManager, UserMixin, current_user, login_required, login_user, logout_user
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -26,7 +30,7 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
     SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE', 'false').lower() == 'true',
-    MAX_CONTENT_LENGTH=64 * 1024,
+    MAX_CONTENT_LENGTH=6 * 1024 * 1024,
 )
 csrf = CSRFProtect(app)
 login_manager = LoginManager(app)
@@ -49,6 +53,10 @@ HERITAGE_CROPS = (
 )
 HERITAGE_NAMES = {item['name'].casefold() for item in HERITAGE_CROPS}
 DATABASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'harvest_pool.db')
+UPLOAD_DIR = Path(app.instance_path) / 'produce_photos'
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+Image.MAX_IMAGE_PIXELS = 20_000_000
+
 
 
 def get_db():
@@ -110,6 +118,14 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         ''')
+        # Phase 8 additive migration. Existing listings have no stated sell-by
+        # date until their owner sets one; do NOT invent freshness dates.
+        listing_fields = {r['name'] for r in db.execute('PRAGMA table_info(produce_listings)')}
+        if 'available_until' not in listing_fields:
+            db.execute('ALTER TABLE produce_listings ADD COLUMN available_until TEXT')
+        if 'photo_filename' not in listing_fields:
+            db.execute('ALTER TABLE produce_listings ADD COLUMN photo_filename TEXT')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_listings_expiry ON produce_listings(available_until)')
         # Preserve older automatic allocations without misrepresenting farmer consent.
         columns = {row['name'] for row in db.execute('PRAGMA table_info(pool_contributions)')}
         if 'offer_status' not in columns:
@@ -299,7 +315,168 @@ def logout():
     return redirect(url_for('login'))
 
 
+@app.template_filter('expiry_warning_date')
+def expiry_warning_date(today_string):
+    return (date.fromisoformat(today_string)+timedelta(days=2)).isoformat()
+
+
+def active_supply_query():
+    return '''SELECT p.id,p.crop,p.available_kg,p.asking_price,p.quality,p.harvest_date,
+        p.available_until,p.photo_filename,f.village,f.name AS farmer_name
+        FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id
+        WHERE p.available_kg>0 AND p.asking_price IS NOT NULL
+          AND p.available_until >= ?
+        '''
+
+
 @app.get('/')
+def home():
+    db=get_db()
+    try:
+        listings=db.execute(active_supply_query()+' ORDER BY p.id DESC LIMIT 6',
+                            (date.today().isoformat(),)).fetchall()
+        count=db.execute('SELECT COUNT(*) FROM produce_listings WHERE available_kg>0 AND available_until >= ?',
+                         (date.today().isoformat(),)).fetchone()[0]
+    finally:
+        db.close()
+    return render_template('home.html', featured=listings, listing_count=count,
+                           heritage_crops=HERITAGE_CROPS, heritage_check=is_heritage)
+
+
+@app.get('/marketplace')
+def marketplace():
+    search=request.args.get('q','').strip()[:80]
+    db=get_db()
+    try:
+        q=active_supply_query()
+        params=[date.today().isoformat()]
+        if search:
+            q+=' AND (p.crop LIKE ? OR f.village LIKE ?)'
+            params.extend(['%'+search+'%']*2)
+        q+=' ORDER BY p.id DESC LIMIT 60'
+        listings=db.execute(q,params).fetchall()
+    finally:
+        db.close()
+    return render_template('marketplace.html', listings=listings, query=search,
+                           heritage_check=is_heritage, today=date.today().isoformat())
+
+
+@app.get('/produce/<int:listing_id>')
+def produce_detail(listing_id):
+    db=get_db()
+    try:
+        listing=db.execute('''SELECT p.*,f.name AS farmer_name,f.village
+                              FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id
+                              WHERE p.id=?''',(listing_id,)).fetchone()
+    finally:
+        db.close()
+    if not listing:
+        abort(404)
+    expired=bool(listing['available_until'] and listing['available_until']<date.today().isoformat())
+    is_owner=(current_user.is_authenticated and current_user.role=='farmer'
+              and current_user.profile_id==listing['farmer_id'])
+    if (expired or listing['available_kg']<=0) and not is_owner:
+        abort(404)
+    return render_template('produce_detail.html', listing=listing,
+                           expired=expired, heritage_check=is_heritage)
+
+
+@app.get('/produce-photo/<int:listing_id>')
+def produce_photo(listing_id):
+    db=get_db()
+    try:
+        row=db.execute('SELECT photo_filename FROM produce_listings WHERE id=?',(listing_id,)).fetchone()
+    finally:
+        db.close()
+    if not row or not row['photo_filename']:
+        abort(404)
+    # Only generated opaque filenames are served; never accept paths from clients.
+    filename=row['photo_filename']
+    if not re.fullmatch(r'[0-9a-f]{32}\.jpg',filename):
+        abort(404)
+    return send_from_directory(str(UPLOAD_DIR), filename, mimetype='image/jpeg',
+                               max_age=3600)
+
+
+def save_produce_photo(upload):
+    if not upload or not upload.filename:
+        return None
+    raw=upload.stream.read(5*1024*1024 + 1)
+    if len(raw)>5*1024*1024:
+        raise ValueError('Photograph must be smaller than 5 MB.')
+    try:
+        with Image.open(io.BytesIO(raw)) as decoded:
+            if decoded.format not in ('JPEG','PNG','WEBP'):
+                raise ValueError('Upload a JPEG, PNG or WebP photo.')
+            decoded.verify()
+        with Image.open(io.BytesIO(raw)) as decoded:
+            photo=ImageOps.exif_transpose(decoded)
+            if photo.width*photo.height>20_000_000:
+                raise ValueError('Image resolution is too large.')
+            photo=photo.convert('RGB')
+            photo.thumbnail((1600,1600))
+            filename=secrets.token_hex(16)+'.jpg'
+            photo.save(UPLOAD_DIR / filename,format='JPEG',quality=82,optimize=True)
+            return filename
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as e:
+        raise ValueError('That file is not a supported or valid photograph.') from e
+
+
+@app.post('/produce/<int:listing_id>/photo')
+@require_role('farmer')
+@limiter.limit('15/hour')
+def upload_produce_photo(listing_id):
+    db=get_db()
+    try:
+        listing=db.execute('SELECT id,photo_filename FROM produce_listings WHERE id=? AND farmer_id=?',
+                           (listing_id,current_user.profile_id)).fetchone()
+    finally:
+        db.close()
+    if listing is None:
+        abort(404)
+    try:
+        filename=save_produce_photo(request.files.get('photo'))
+    except ValueError as e:
+        flash(str(e),'error')
+        return redirect(url_for('dashboard'))
+    if not filename:
+        flash('Select an image to upload.','error')
+        return redirect(url_for('dashboard'))
+    db=get_db()
+    try:
+        with db:
+            db.execute('UPDATE produce_listings SET photo_filename=? WHERE id=? AND farmer_id=?',
+                       (filename,listing_id,current_user.profile_id))
+    finally:
+        db.close()
+    # Avoid automatic deletion of previously referenced images on error.
+    flash('Produce photo updated.','success')
+    return redirect(url_for('dashboard'))
+
+
+@app.post('/produce/<int:listing_id>/availability')
+@require_role('farmer')
+def update_availability(listing_id):
+    expiry=request.form.get('available_until','').strip()
+    db=get_db()
+    try:
+        row=db.execute('SELECT harvest_date FROM produce_listings WHERE id=? AND farmer_id=?',
+                       (listing_id,current_user.profile_id)).fetchone()
+        if not row:
+            abort(404)
+        if not parse_date(expiry) or expiry<row['harvest_date'] or expiry < date.today().isoformat():
+            flash('Choose an availability deadline on or after the harvest-ready date.','error')
+            return redirect(url_for('dashboard'))
+        with db:
+            db.execute('UPDATE produce_listings SET available_until=? WHERE id=? AND farmer_id=?',
+                       (expiry,listing_id,current_user.profile_id))
+    finally:
+        db.close()
+    flash('Availability deadline updated.','success')
+    return redirect(url_for('dashboard'))
+
+
+@app.get('/dashboard')
 @login_required
 def dashboard():
     db = get_db()
@@ -319,7 +496,7 @@ def dashboard():
                 LEFT JOIN demo_orders o ON o.demand_id = d.id
                 WHERE pc.farmer_id = ? ORDER BY pc.id DESC
             ''', (current_user.profile_id,)).fetchall()
-            return render_template('index.html', my_listings=my_listings,
+            return render_template('index.html', my_listings=my_listings, today=date.today().isoformat(),
                                    my_contributions=my_contributions,
                                    my_demands=[], market_listings=[], my_pools=[], demo_orders=[],
                                    heritage_crops=HERITAGE_CROPS, heritage_check=is_heritage,
@@ -330,7 +507,7 @@ def dashboard():
             SELECT p.id, p.crop, p.available_kg, p.asking_price, p.quality, p.harvest_date,
                    f.village
             FROM produce_listings p JOIN farmers f ON f.id = p.farmer_id
-            WHERE p.available_kg > 0 ORDER BY p.id DESC
+            WHERE p.available_kg > 0 AND p.available_until >= date('now') ORDER BY p.id DESC
         ''').fetchall()
         offer_summary = db.execute('''
             SELECT d.id AS demand_id,
@@ -359,7 +536,7 @@ def dashboard():
                     FROM demo_orders o JOIN buyer_demands d ON d.id=o.demand_id
                     WHERE o.buyer_id=? ORDER BY o.id DESC""", (current_user.profile_id,)).fetchall()
         return render_template('index.html', my_listings=[], my_contributions=[],
-                               my_demands=my_demands, market_listings=market_listings,
+                               my_demands=my_demands, market_listings=market_listings, today=date.today().isoformat(),
                                my_pools=my_pools, summary=summary, demo_orders=demo_orders,
                                demo_order_demand_ids={o['demand_id'] for o in demo_orders},
                                heritage_crops=HERITAGE_CROPS, heritage_check=is_heritage,
@@ -376,19 +553,25 @@ def add_produce():
     harvested = request.form.get('harvest_date', '')
     quality = request.form.get('quality', '')
     asking = positive_number(request.form.get('asking_price'))
+    expiry = request.form.get('available_until', '').strip()
     if not asking or asking > 1_000_000:
         flash('Enter a valid asking price per kg.', 'error')
         return redirect(url_for('dashboard'))
-    if not crop or len(crop) > 100 or not qty or not parse_date(harvested) or quality not in ('Grade A', 'Grade B', 'Mixed'):
+    if not crop or len(crop) > 100 or not qty or not parse_date(harvested) or not parse_date(expiry) or expiry < harvested or expiry < date.today().isoformat() or quality not in ('Grade A', 'Grade B', 'Mixed'):
         flash('Complete valid produce details.', 'error')
+        return redirect(url_for('dashboard'))
+    try:
+        filename=save_produce_photo(request.files.get('photo'))
+    except ValueError as e:
+        flash(str(e),'error')
         return redirect(url_for('dashboard'))
     db = get_db()
     try:
         with db:
             db.execute('''INSERT INTO produce_listings
-                (farmer_id, crop, quantity_kg, available_kg, harvest_date, quality, asking_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                (current_user.profile_id, crop, qty, qty, harvested, quality, asking))
+                (farmer_id, crop, quantity_kg, available_kg, harvest_date, quality, asking_price, available_until, photo_filename)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (current_user.profile_id, crop, qty, qty, harvested, quality, asking, expiry, filename))
     finally:
         db.close()
     flash('Your produce was listed.', 'success')
@@ -524,6 +707,7 @@ def match_supply(demand_id):
                 FROM produce_listings p
                 WHERE LOWER(p.crop)=LOWER(?) AND p.available_kg > 0 AND p.harvest_date <= ?
                   AND p.asking_price IS NOT NULL AND p.asking_price <= ?
+                  AND p.available_until >= date('now')
                 ORDER BY p.asking_price ASC, p.harvest_date ASC, p.id ASC''',
                 (demand['crop'], demand['deadline'], demand['target_price'])).fetchall()
             for listing in listings:
@@ -564,7 +748,7 @@ def respond_to_offer(contribution_id, decision):
     db = get_db()
     try:
         db.execute('BEGIN IMMEDIATE')
-        offer = db.execute('''SELECT pc.*, p.available_kg
+        offer = db.execute('''SELECT pc.*, p.available_kg, p.available_until
             FROM pool_contributions pc
             JOIN produce_listings p ON p.id=pc.listing_id
             WHERE pc.id=? AND pc.farmer_id=? AND p.farmer_id=?''',
@@ -583,6 +767,10 @@ def respond_to_offer(contribution_id, decision):
             flash('This offer has already been handled or belongs to an older test pool.', 'error')
             return redirect(url_for('dashboard'))
         if decision == 'accept':
+            if offer['available_until'] and offer['available_until'] < date.today().isoformat():
+                db.rollback()
+                flash('This produce listing is no longer available. Reject the offer instead.', 'error')
+                return redirect(url_for('dashboard'))
             updated = db.execute('''UPDATE produce_listings
                 SET available_kg=available_kg-?
                 WHERE id=? AND farmer_id=? AND available_kg >= ?''',
