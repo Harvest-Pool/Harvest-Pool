@@ -1,0 +1,19 @@
+{% extends 'base.html' %}{% block content %}
+<div class="kicker">ORDER ACCOUNTING · INDICATIVE ONLY</div>
+<h1>Order #{{ order.id }} · Farmer allocation breakdown</h1>
+<p class="muted">{{ order.crop }} · {{ order.business_name }} · {{ order.status }}</p>
+<section class="panel"><h2>{{ 'Your allocation' if viewing_farmer else 'One buyer order, multiple grower allocations' }}</h2>
+<p class="muted">No real payment, settlement, escrow, refund or payout is represented on this page. Gross amounts are based on the buyer's offered price and each farmer's accepted quantity. They do not account for payment-provider fees, marketplace fees, delivery costs or taxes.</p>
+<div class="table-wrap"><table><thead><tr><th>Farmer</th><th>Accepted quantity</th><th>Buyer-facing gross allocation</th><th>Farmer asking price (R/kg)</th><th>State</th></tr></thead><tbody>
+{% for a in allocations %}<tr><td>{{ a.farmer_name }}</td><td>{{ a.quantity_kg }} kg</td><td>R{{ '%.2f'|format(a.gross_cents/100) }}</td><td>{{ 'R%.2f'|format(a.farmer_asking_price_cents/100) if a.farmer_asking_price_cents is not none else 'Not recorded' }}</td><td>{{ a.status }}</td></tr>
+{% else %}<tr><td colspan="5">This is an older order without an allocation snapshot. No split can be claimed until reconciled.</td></tr>{% endfor %}
+</tbody></table></div></section>
+{% if not viewing_farmer %}
+<section class="panel"><h2>Order reconciliation</h2>
+<p>Buyer indicative total: <strong>R{{ '%.2f'|format(order.indicative_total_cents/100) }}</strong></p>
+<p>Sum of farmer allocations: <strong>R{{ '%.2f'|format(allocated_total_cents/100) }}</strong></p>
+<p><strong>{{ 'Balances exactly' if reconciled else 'Not reconciled — historical or incomplete allocations' }}</strong></p>
+<p class="muted">Actual payouts require verified provider settlement events and a fee/refund policy. Do not transfer money based on this preview.</p></section>
+{% endif %}
+<p><a href="{{ url_for('dashboard') }}">Back to dashboard</a></p>
+{% endblock %}

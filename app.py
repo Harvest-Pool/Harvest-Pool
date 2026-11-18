@@ -10,6 +10,7 @@ import os
 import re
 import sqlite3
 from datetime import date, datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -176,6 +177,23 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
+        # Phase 10: per-farmer allocation snapshot for each buyer order.
+        # No disbursements, bank details or real payment events are recorded here.
+        db.execute("""CREATE TABLE IF NOT EXISTS order_farmer_allocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL REFERENCES demo_orders(id),
+            contribution_id INTEGER NOT NULL UNIQUE REFERENCES pool_contributions(id),
+            farmer_id INTEGER NOT NULL REFERENCES farmers(id),
+            quantity_kg TEXT NOT NULL,
+            buyer_unit_price_cents INTEGER NOT NULL CHECK (buyer_unit_price_cents > 0),
+            gross_cents INTEGER NOT NULL CHECK (gross_cents >= 0),
+            farmer_asking_price_cents INTEGER,
+            status TEXT NOT NULL DEFAULT 'Allocation recorded'
+                CHECK (status IN ('Allocation recorded')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute('CREATE INDEX IF NOT EXISTS idx_order_farmer_allocations_order ON order_farmer_allocations(order_id)')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_order_farmer_allocations_farmer ON order_farmer_allocations(farmer_id)')
         contribution_cols = {row['name'] for row in db.execute('PRAGMA table_info(pool_contributions)')}
         if 'demo_ready' not in contribution_cols:
             db.execute('ALTER TABLE pool_contributions ADD COLUMN demo_ready INTEGER NOT NULL DEFAULT 0')
@@ -805,9 +823,10 @@ def respond_to_offer(contribution_id, decision):
     db = get_db()
     try:
         db.execute('BEGIN IMMEDIATE')
-        offer = db.execute('''SELECT pc.*, p.available_kg, p.available_until
+        offer = db.execute('''SELECT pc.*, p.available_kg, p.available_until, f.verification_status
             FROM pool_contributions pc
             JOIN produce_listings p ON p.id=pc.listing_id
+            JOIN farmers f ON f.id=p.farmer_id
             WHERE pc.id=? AND pc.farmer_id=? AND p.farmer_id=?''',
             (contribution_id, current_user.profile_id, current_user.profile_id)).fetchone()
         if not offer:
@@ -824,6 +843,10 @@ def respond_to_offer(contribution_id, decision):
             flash('This offer has already been handled or belongs to an older test pool.', 'error')
             return redirect(url_for('dashboard'))
         if decision == 'accept':
+            if offer['verification_status'] != 'Approved':
+                db.rollback()
+                flash('Seller review approval is required before accepting a new offer.', 'error')
+                return redirect(url_for('dashboard'))
             if offer['available_until'] and offer['available_until'] < date.today().isoformat():
                 db.rollback()
                 flash('This produce listing is no longer available. Reject the offer instead.', 'error')
@@ -855,6 +878,58 @@ def respond_to_offer(contribution_id, decision):
     return redirect(url_for('dashboard'))
 
 
+
+
+def money_cents(value):
+    """Round a non-negative rand amount to whole cents, half up."""
+    amount = Decimal(str(value))
+    if not amount.is_finite() or amount < 0:
+        raise ValueError('Invalid non-negative amount')
+    return int((amount * 100).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+
+
+def allocate_buyer_total(rows, total_cents):
+    """Deterministic largest-remainder allocation, so shares total exactly.
+
+    Rows are accepted farmer contributions. Their buyer-facing shares are based
+    on contributed quantity, not on the farmer's asking price or estimated costs.
+    This is an indicative gross allocation only, NOT a payment or payout.
+    """
+    if not rows or total_cents <= 0:
+        raise ValueError('Accepted quantities and positive order total required')
+    weights = [Decimal(str(x['quantity_kg'])) for x in rows]
+    if any(not x.is_finite() or x <= 0 for x in weights):
+        raise ValueError('Invalid accepted quantity')
+    total_kg = sum(weights)
+    exact = [Decimal(total_cents) * weight / total_kg for weight in weights]
+    cents = [int(x.to_integral_value(rounding=ROUND_DOWN)) for x in exact]
+    missing = total_cents - sum(cents)
+    order = sorted(range(len(rows)), key=lambda i: (-(exact[i]-cents[i]), rows[i]['id']))
+    for i in order[:missing]:
+        cents[i] += 1
+    assert sum(cents) == total_cents
+    return cents
+
+
+def snapshot_order_allocations(db, order_id, demand_id, total_cents):
+    rows = db.execute("""SELECT pc.id, pc.farmer_id, pc.quantity_kg,
+           pc.farmer_asking_price
+        FROM pool_contributions pc
+        JOIN harvest_pools hp ON hp.id=pc.pool_id
+        WHERE hp.demand_id=? AND pc.offer_status='Accepted'
+        ORDER BY pc.id""", (demand_id,)).fetchall()
+    amounts = allocate_buyer_total(rows, total_cents)
+    demand = db.execute('SELECT target_price FROM buyer_demands WHERE id=?', (demand_id,)).fetchone()
+    buyer_cents = money_cents(demand['target_price'])
+    for r, amount in zip(rows, amounts):
+        asking = (money_cents(r['farmer_asking_price'])
+                  if r['farmer_asking_price'] is not None else None)
+        db.execute("""INSERT INTO order_farmer_allocations
+            (order_id,contribution_id,farmer_id,quantity_kg,buyer_unit_price_cents,gross_cents,farmer_asking_price_cents)
+            VALUES(?,?,?,?,?,?,?)""",
+            (order_id,r['id'],r['farmer_id'],str(r['quantity_kg']),buyer_cents,amount,asking))
+    if sum(amounts) != total_cents:
+        raise ValueError('Order total does not reconcile')
 
 
 # PHASE 6: Simulated orders. Never take payment details or represent a demo
@@ -890,8 +965,9 @@ def create_demo_order(demand_id):
         from decimal import Decimal, ROUND_HALF_UP
         total = (Decimal(str(demand['quantity_kg'])) * Decimal(str(demand['target_price'])) * 100)
         cents = int(total.quantize(Decimal('1'), rounding=ROUND_HALF_UP))
-        db.execute('''INSERT INTO demo_orders(demand_id,buyer_id,total_kg,indicative_total_cents)
+        cursor = db.execute('''INSERT INTO demo_orders(demand_id,buyer_id,total_kg,indicative_total_cents)
             VALUES (?,?,?,?)''', (demand_id, current_user.profile_id, demand['quantity_kg'], cents))
+        snapshot_order_allocations(db, cursor.lastrowid, demand_id, cents)
         db.commit()
     except Exception:
         db.rollback()
@@ -900,6 +976,48 @@ def create_demo_order(demand_id):
         db.close()
     flash('Demo order created. This is an estimate, not an invoice or payment request.', 'success')
     return redirect(url_for('dashboard'))
+
+
+@app.get('/orders/<int:order_id>/allocations')
+@login_required
+def order_allocations_detail(order_id):
+    db = get_db()
+    try:
+        order = db.execute("""SELECT o.*, d.crop, d.delivery_location, b.business_name
+            FROM demo_orders o
+            JOIN buyer_demands d ON d.id=o.demand_id
+            JOIN buyers b ON b.id=o.buyer_id WHERE o.id=?""", (order_id,)).fetchone()
+        if order is None:
+            abort(404)
+        if current_user.role == 'buyer' and current_user.profile_id != order['buyer_id']:
+            abort(404)
+        if current_user.role == 'farmer':
+            entitled = db.execute("""SELECT 1 FROM order_farmer_allocations
+                WHERE order_id=? AND farmer_id=?""", (order_id,current_user.profile_id)).fetchone()
+            if not entitled:
+                abort(404)
+        elif current_user.role not in ('buyer','admin'):
+            abort(403)
+        # Farmers see ONLY their own breakdown; buyers/admin see all allocations.
+        if current_user.role == 'farmer':
+            rows = db.execute("""SELECT a.*, f.name AS farmer_name, pc.offer_status
+                FROM order_farmer_allocations a JOIN farmers f ON f.id=a.farmer_id
+                JOIN pool_contributions pc ON pc.id=a.contribution_id
+                WHERE a.order_id=? AND a.farmer_id=? ORDER BY a.id""",
+                (order_id, current_user.profile_id)).fetchall()
+        else:
+            rows = db.execute("""SELECT a.*, f.name AS farmer_name, pc.offer_status
+                FROM order_farmer_allocations a JOIN farmers f ON f.id=a.farmer_id
+                JOIN pool_contributions pc ON pc.id=a.contribution_id
+                WHERE a.order_id=? ORDER BY a.id""", (order_id,)).fetchall()
+        full_sum = db.execute('SELECT COALESCE(SUM(gross_cents),0) FROM order_farmer_allocations WHERE order_id=?',
+                              (order_id,)).fetchone()[0]
+        return render_template('order_allocations.html', order=order, allocations=rows,
+                               allocated_total_cents=full_sum,
+                               reconciled=bool(rows) and full_sum==order['indicative_total_cents'],
+                               viewing_farmer=current_user.role=='farmer')
+    finally:
+        db.close()
 
 
 @app.post('/demo-orders/<int:order_id>/mark-paid')
