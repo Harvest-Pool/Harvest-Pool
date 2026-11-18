@@ -19,6 +19,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect, CSRFError
 from werkzeug.security import check_password_hash, generate_password_hash
+import click
 
 load_dotenv()
 app = Flask(__name__)
@@ -126,6 +127,28 @@ def init_db():
         if 'photo_filename' not in listing_fields:
             db.execute('ALTER TABLE produce_listings ADD COLUMN photo_filename TEXT')
         db.execute('CREATE INDEX IF NOT EXISTS idx_listings_expiry ON produce_listings(available_until)')
+        # Existing farmers are intentionally PENDING: don't certify old test profiles.
+        farmer_cols = {r['name'] for r in db.execute('PRAGMA table_info(farmers)')}
+        if 'verification_status' not in farmer_cols:
+            db.execute("ALTER TABLE farmers ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'Pending'")
+        if 'verified_at' not in farmer_cols:
+            db.execute('ALTER TABLE farmers ADD COLUMN verified_at TEXT')
+        db.execute("""CREATE TABLE IF NOT EXISTS admin_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS seller_review_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            farmer_id INTEGER NOT NULL REFERENCES farmers(id),
+            admin_id INTEGER NOT NULL REFERENCES admin_accounts(id),
+            previous_status TEXT NOT NULL,
+            new_status TEXT NOT NULL,
+            review_note TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
         # Preserve older automatic allocations without misrepresenting farmer consent.
         columns = {row['name'] for row in db.execute('PRAGMA table_info(pool_contributions)')}
         if 'offer_status' not in columns:
@@ -177,15 +200,40 @@ class User(UserMixin):
         return self.active
 
 
+class AdminUser(UserMixin):
+    role = 'admin'
+    profile_id = None
+    def __init__(self, row):
+        self.db_id = row['id']
+        self.email = row['email']
+        self.active = bool(row['is_active'])
+
+    def get_id(self):
+        return f'admin:{self.db_id}'
+
+    @property
+    def is_active(self):
+        return self.active
+
+
 @login_manager.user_loader
 def load_user(user_id):
-    try:
-        user_id = int(user_id)
-    except (TypeError, ValueError):
-        return None
     db = get_db()
     try:
-        row = db.execute('SELECT * FROM users WHERE id = ? AND is_active = 1', (user_id,)).fetchone()
+        if isinstance(user_id, str) and user_id.startswith('admin:'):
+            try:
+                admin_id = int(user_id.partition(':')[2])
+            except ValueError:
+                return None
+            row = db.execute('SELECT * FROM admin_accounts WHERE id=? AND is_active=1',
+                             (admin_id,)).fetchone()
+            return AdminUser(row) if row else None
+        try:
+            numeric_id = int(user_id)
+        except (TypeError, ValueError):
+            return None
+        row = db.execute('SELECT * FROM users WHERE id=? AND is_active=1',
+                         (numeric_id,)).fetchone()
         return User(row) if row else None
     finally:
         db.close()
@@ -243,7 +291,7 @@ def bad_csrf(_):
 @limiter.limit('8 per minute', methods=['POST'])
 def register():
     if current_user.is_authenticated:
-        return redirect(url_for('dashboard'))
+        return redirect(url_for('admin_dashboard' if current_user.role == 'admin' else 'dashboard'))
     if request.method == 'GET':
         return render_template('register.html')
 
@@ -290,7 +338,7 @@ def register():
 @limiter.limit('8 per minute', methods=['POST'])
 def login():
     if current_user.is_authenticated:
-        return redirect(url_for('dashboard'))
+        return redirect(url_for('admin_dashboard' if current_user.role == 'admin' else 'dashboard'))
     if request.method == 'GET':
         return render_template('login.html')
     email = request.form.get('email', '').strip().lower()
@@ -325,6 +373,7 @@ def active_supply_query():
         p.available_until,p.photo_filename,f.village,f.name AS farmer_name
         FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id
         WHERE p.available_kg>0 AND p.asking_price IS NOT NULL
+          AND f.verification_status='Approved'
           AND p.available_until >= ?
         '''
 
@@ -335,7 +384,7 @@ def home():
     try:
         listings=db.execute(active_supply_query()+' ORDER BY p.id DESC LIMIT 6',
                             (date.today().isoformat(),)).fetchall()
-        count=db.execute('SELECT COUNT(*) FROM produce_listings WHERE available_kg>0 AND available_until >= ?',
+        count=db.execute("""SELECT COUNT(*) FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id WHERE p.available_kg>0 AND f.verification_status='Approved' AND p.available_until >= ?""",
                          (date.today().isoformat(),)).fetchone()[0]
     finally:
         db.close()
@@ -365,7 +414,7 @@ def marketplace():
 def produce_detail(listing_id):
     db=get_db()
     try:
-        listing=db.execute('''SELECT p.*,f.name AS farmer_name,f.village
+        listing=db.execute('''SELECT p.*,f.name AS farmer_name,f.village,f.verification_status
                               FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id
                               WHERE p.id=?''',(listing_id,)).fetchone()
     finally:
@@ -375,7 +424,7 @@ def produce_detail(listing_id):
     expired=bool(listing['available_until'] and listing['available_until']<date.today().isoformat())
     is_owner=(current_user.is_authenticated and current_user.role=='farmer'
               and current_user.profile_id==listing['farmer_id'])
-    if (expired or listing['available_kg']<=0) and not is_owner:
+    if (expired or listing['available_kg']<=0 or listing['verification_status']!='Approved') and not is_owner:
         abort(404)
     return render_template('produce_detail.html', listing=listing,
                            expired=expired, heritage_check=is_heritage)
@@ -385,10 +434,14 @@ def produce_detail(listing_id):
 def produce_photo(listing_id):
     db=get_db()
     try:
-        row=db.execute('SELECT photo_filename FROM produce_listings WHERE id=?',(listing_id,)).fetchone()
+        row=db.execute('''SELECT p.photo_filename,p.farmer_id,f.verification_status
+            FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id WHERE p.id=?''',
+            (listing_id,)).fetchone()
     finally:
         db.close()
-    if not row or not row['photo_filename']:
+    is_owner=(current_user.is_authenticated and current_user.role=='farmer'
+              and current_user.profile_id==row['farmer_id']) if row else False
+    if not row or not row['photo_filename'] or (row['verification_status']!='Approved' and not is_owner):
         abort(404)
     # Only generated opaque filenames are served; never accept paths from clients.
     filename=row['photo_filename']
@@ -479,9 +532,13 @@ def update_availability(listing_id):
 @app.get('/dashboard')
 @login_required
 def dashboard():
+    if current_user.role == 'admin':
+        return redirect(url_for('admin_dashboard'))
     db = get_db()
     try:
         if current_user.role == 'farmer':
+            farmer_profile = db.execute('SELECT verification_status FROM farmers WHERE id=?',
+                                       (current_user.profile_id,)).fetchone()
             my_listings = db.execute('''SELECT * FROM produce_listings WHERE farmer_id = ?
                                         ORDER BY id DESC''', (current_user.profile_id,)).fetchall()
             my_contributions = db.execute('''
@@ -497,7 +554,7 @@ def dashboard():
                 WHERE pc.farmer_id = ? ORDER BY pc.id DESC
             ''', (current_user.profile_id,)).fetchall()
             return render_template('index.html', my_listings=my_listings, today=date.today().isoformat(),
-                                   my_contributions=my_contributions,
+                                   my_contributions=my_contributions, seller_verification=farmer_profile['verification_status'],
                                    my_demands=[], market_listings=[], my_pools=[], demo_orders=[],
                                    heritage_crops=HERITAGE_CROPS, heritage_check=is_heritage,
                                    estimated_net=estimated_net)
@@ -507,7 +564,7 @@ def dashboard():
             SELECT p.id, p.crop, p.available_kg, p.asking_price, p.quality, p.harvest_date,
                    f.village
             FROM produce_listings p JOIN farmers f ON f.id = p.farmer_id
-            WHERE p.available_kg > 0 AND p.available_until >= date('now') ORDER BY p.id DESC
+            WHERE p.available_kg > 0 AND p.available_until >= date('now') AND f.verification_status='Approved' ORDER BY p.id DESC
         ''').fetchall()
         offer_summary = db.execute('''
             SELECT d.id AS demand_id,
@@ -704,8 +761,8 @@ def match_supply(demand_id):
             listings = db.execute('''SELECT p.*,
                 COALESCE((SELECT SUM(pc.quantity_kg) FROM pool_contributions pc
                           WHERE pc.listing_id=p.id AND pc.offer_status='Pending'),0) AS pending_kg
-                FROM produce_listings p
-                WHERE LOWER(p.crop)=LOWER(?) AND p.available_kg > 0 AND p.harvest_date <= ?
+                FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id
+                WHERE f.verification_status='Approved' AND LOWER(p.crop)=LOWER(?) AND p.available_kg > 0 AND p.harvest_date <= ?
                   AND p.asking_price IS NOT NULL AND p.asking_price <= ?
                   AND p.available_until >= date('now')
                 ORDER BY p.asking_price ASC, p.harvest_date ASC, p.id ASC''',
@@ -926,6 +983,108 @@ def demo_confirm_delivery(order_id):
 @login_required
 def disabled_legacy_registration():
     abort(403)
+
+
+
+# -----------------------------
+# Seller review (not a substitute for legal KYC or onsite produce inspection)
+# -----------------------------
+@app.cli.command('create-admin')
+def create_admin():
+    # Create an admin account locally; no public administrator registration.
+    email = click.prompt('Administrator email').strip().lower()
+    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
+        raise click.ClickException('Please enter a valid email address.')
+    password = click.prompt('Administrator password (minimum 12 characters)', hide_input=True,
+                            confirmation_prompt=True)
+    if len(password) < 12:
+        raise click.ClickException('Password must have at least 12 characters.')
+    db = get_db()
+    try:
+        with db:
+            db.execute('INSERT INTO admin_accounts(email,password_hash) VALUES (?,?)',
+                       (email, generate_password_hash(password)))
+    except sqlite3.IntegrityError:
+        raise click.ClickException('Administrator email already exists.')
+    finally:
+        db.close()
+    click.echo('Administrator account created.')
+
+
+@app.route('/admin/login', methods=['GET', 'POST'])
+@limiter.limit('5 per minute', methods=['POST'])
+def admin_login():
+    if current_user.is_authenticated:
+        return redirect(url_for('admin_dashboard' if current_user.role=='admin' else 'dashboard'))
+    if request.method == 'GET':
+        return render_template('admin_login.html')
+    email = request.form.get('email','').strip().lower()
+    password = request.form.get('password','')
+    db = get_db()
+    try:
+        row = db.execute('SELECT * FROM admin_accounts WHERE email=? AND is_active=1',
+                         (email,)).fetchone()
+    finally:
+        db.close()
+    if not row or not check_password_hash(row['password_hash'], password):
+        flash('Incorrect email or password.','error')
+        return render_template('admin_login.html'),401
+    login_user(AdminUser(row), remember=False, fresh=True)
+    return redirect(url_for('admin_dashboard'))
+
+
+@app.get('/admin')
+@require_role('admin')
+def admin_dashboard():
+    db = get_db()
+    try:
+        farmers = db.execute('''SELECT f.id,f.name,f.phone,f.village,f.verification_status,
+          f.verified_at,COUNT(p.id) AS listing_count
+          FROM farmers f LEFT JOIN produce_listings p ON p.farmer_id=f.id
+          GROUP BY f.id ORDER BY CASE f.verification_status
+              WHEN 'Pending' THEN 0 WHEN 'Suspended' THEN 1 ELSE 2 END,f.id DESC''').fetchall()
+        events = db.execute('''SELECT e.*,f.name AS farmer_name,a.email AS admin_email
+          FROM seller_review_events e JOIN farmers f ON f.id=e.farmer_id
+          JOIN admin_accounts a ON a.id=e.admin_id ORDER BY e.id DESC LIMIT 40''').fetchall()
+    finally:
+        db.close()
+    return render_template('admin_dashboard.html',farmers=farmers,events=events)
+
+
+@app.post('/admin/sellers/<int:farmer_id>/review')
+@require_role('admin')
+@limiter.limit('30 per hour')
+def admin_review_seller(farmer_id):
+    status = request.form.get('decision','')
+    note = request.form.get('note','').strip()
+    if status not in ('Approved','Rejected','Suspended','Pending') or not (10<=len(note)<=500):
+        flash('Choose a valid decision and enter a review note (10–500 characters).','error')
+        return redirect(url_for('admin_dashboard'))
+    if status=='Approved' and request.form.get('attest')!='yes':
+        flash('Before approval, confirm you personally completed the required checks.','error')
+        return redirect(url_for('admin_dashboard'))
+    db = get_db()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        farmer = db.execute('SELECT verification_status FROM farmers WHERE id=?',
+                            (farmer_id,)).fetchone()
+        if not farmer:
+            db.rollback()
+            abort(404)
+        db.execute('''UPDATE farmers SET verification_status=?,
+          verified_at=CASE WHEN ?='Approved' THEN CURRENT_TIMESTAMP ELSE NULL END
+          WHERE id=?''',(status,status,farmer_id))
+        db.execute('''INSERT INTO seller_review_events
+          (farmer_id,admin_id,previous_status,new_status,review_note)
+          VALUES (?,?,?,?,?)''',(farmer_id,current_user.db_id,farmer['verification_status'],status,note))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    flash('Seller review status updated.','success')
+    return redirect(url_for('admin_dashboard'))
 
 
 init_db()

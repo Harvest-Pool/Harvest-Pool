@@ -1,0 +1,12 @@
+{% extends 'base.html' %}{% block title %}Seller reviews · Harvest Pool{% endblock %}
+{% block content %}<section class="panel"><div class="kicker">MARKETPLACE ADMINISTRATION</div><h1>Seller review centre</h1>
+<p class="muted">Only approve sellers after independently checking contact details, seller legitimacy and appropriate evidence of produce sourcing. This panel does not verify government IDs, bank accounts or food-safety compliance. Never enter ID numbers or banking details in review notes.</p></section>
+<section class="panel"><h2>Farmer accounts</h2><div class="table-wrap"><table><thead><tr><th>Seller</th><th>Contact</th><th>Listings</th><th>Status</th><th>Review action</th></tr></thead><tbody>
+{% for f in farmers %}<tr><td><strong>{{ f.name }}</strong><div class="muted">{{ f.village }}</div></td><td>{{ f.phone }}</td><td>{{ f.listing_count }}</td><td>{{ f.verification_status }}</td><td>
+<form method="post" action="{{ url_for('admin_review_seller',farmer_id=f.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label>Decision<select name="decision" required><option value="Pending">Pending</option><option value="Approved">Approve</option><option value="Rejected">Reject</option><option value="Suspended">Suspend</option></select></label>
+<label>Review reason (10–500 characters)<textarea name="note" minlength="10" maxlength="500" rows="2" required placeholder="Non-sensitive explanation of decision"></textarea></label>
+<label><input type="checkbox" name="attest" value="yes"> I completed necessary independent checks before approving</label>
+<button type="submit" class="small">Record decision</button></form></td></tr>{% else %}<tr><td colspan="5">No farmers registered</td></tr>{% endfor %}</tbody></table></div></section>
+<section class="panel"><h2>Recent review events</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Seller</th><th>Change</th><th>Reviewed by</th><th>Note</th></tr></thead><tbody>
+{% for e in events %}<tr><td>{{ e.created_at }}</td><td>{{ e.farmer_name }}</td><td>{{ e.previous_status }} → {{ e.new_status }}</td><td>{{ e.admin_email }}</td><td>{{ e.review_note }}</td></tr>{% else %}<tr><td colspan="5">No reviews recorded yet</td></tr>{% endfor %}</tbody></table></div></section>{% endblock %}
