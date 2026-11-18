@@ -1,0 +1,57 @@
+{% extends 'base.html' %}
+{% block title %}Financial planning ? Harvest Pool{% endblock %}
+{% macro zar(value) %}R{{ '{:,.2f}'.format(value) }}{% endmacro %}
+{% macro fields(spec, values) %}
+<div class="pilot-grid pilot-fields">
+{% for key, field in spec.items() %}
+<label>{{ field[0] }}<input type="number" min="0" max="{{ field[2] }}" step="{{ 10 ** (-field[3]) }}" name="{{ key }}" value="{{ values[key] }}" required></label>
+{% endfor %}
+</div>
+{% endmacro %}
+{% block content %}
+<h1>Financial planning</h1>
+<p>Illustrative monthly projections in ZAR. Produce proceeds pass through to farmers. Service rates are pilot assumptions and coordination fees are excluded from test checkout.</p>
+<nav class="pilot-tabs" aria-label="Financial scenarios">
+{% for key in scenarios %}<a href="{{ url_for('finance', scenario=key) }}" {% if key == scenario %}aria-current="page"{% endif %}>{{ {'base':'Base case','conservative':'Conservative','growth':'Growth'}[key] }}</a>{% endfor %}
+</nav>
+<div class="pilot-grid">
+{% for title, value in [('Produce GMV / farmer gross proceeds',model.gmv),('Total service revenue',model.sales),('Direct costs',model.direct_costs),('Contribution margin',model.contribution),('Fixed costs',model.fixed),('Estimated operating profit / loss',model.profit)] %}
+<article class="workspace-card pilot-metric"><h2>{{ title }}</h2><strong>{{ zar(value) }}</strong></article>
+{% endfor %}
+</div>
+<section class="workspace-card pilot-space">
+<h2>Monthly revenue and costs</h2>
+<dl class="pilot-breakdown">
+{% for key, value in model.revenue.items() %}<div><dt>{{ key|capitalize }} revenue</dt><dd>{{ zar(value) }}</dd></div>{% endfor %}
+{% for key, value in model.service_costs.items() %}<div><dt>{{ key|capitalize }} direct cost</dt><dd>{{ zar(value) }}</dd></div>{% endfor %}
+<div><dt>Gross profit before gateway, transport and other variable costs</dt><dd>{{ zar(model.sales - model.service_costs.values()|sum) }}</dd></div>
+<div><dt>Payment gateway fees</dt><dd>{{ zar(model.gateway) }}</dd></div>
+<div><dt>Transport</dt><dd>{{ zar(model.transport) }}</dd></div>
+<div><dt>Other variable costs</dt><dd>{{ zar(model.other_variable) }}</dd></div>
+<div><dt>Contribution per order</dt><dd>{{ zar(model.per_order) }}</dd></div>
+<div><dt>Break-even orders per month</dt><dd>{{ model.break_even if model.break_even is not none else 'Requires positive modeled contribution per order' }}</dd></div>
+</dl>
+</section>
+<form class="workspace-card modern-form pilot-space" method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<h2>Scenario assumptions</h2>
+{{ fields(input_fields, inputs) }}
+<h2>Shared pilot rates</h2>
+<p>Changes apply to all scenarios and new packaging estimates. Saved quote estimates retain their original rates.</p>
+{{ fields(rate_fields, rates) }}
+<button class="action-main">Save scenario and rates</button>
+</form>
+<section class="workspace-card pilot-space"><h2>12-month projection</h2>
+<p>Assumes constant monthly volume, zero opening cash and no pre-existing receivables or payables. Service receipts lag {{ inputs.collections_lag }} month(s) and variable supplier costs lag {{ inputs.cost_lag }} month(s). Gateway fees and fixed costs are paid in the order month. Cash excludes pass-through produce proceeds, taxes, VAT, financing and capital expenditure.</p>
+<div class="pilot-table"><table><thead><tr><th>Month</th><th>Produce GMV</th><th>Service revenue</th><th>Operating profit</th><th>Net cash flow</th><th>Cumulative cash flow</th></tr></thead>
+<tbody>{% for row in model.months %}<tr><th scope="row">{{ row[0] }}</th>{% for value in row[1:] %}<td>{{ zar(value) }}</td>{% endfor %}</tr>{% endfor %}</tbody></table></div></section>
+<section class="workspace-card pilot-space"><h2>Example ? 1,000 kg of potatoes</h2>
+<p>R15 per kg yields R15,000 in produce GMV. The example uses one labelled unit per kilogram, full packaging, one new design and the original pilot rates.</p>
+<dl class="pilot-breakdown">
+{% for key, value in example_revenue.items() %}<div><dt>{{ key|capitalize }} revenue</dt><dd>{{ zar(value) }}</dd></div>{% endfor %}
+<div><dt>Total service revenue</dt><dd>{{ zar(example_revenue.values()|sum) }}</dd></div>
+<div><dt>Illustrative direct service costs</dt><dd>{{ zar(example_costs.values()|sum) }}</dd></div>
+<div><dt>Contribution before provider fees, other costs and taxes</dt><dd>{{ zar((example_revenue.values()|sum) - (example_costs.values()|sum)) }}</dd></div>
+</dl>
+<p>Confirm tax and VAT treatment against Harvest Pool?s legal and tax circumstances before trading.</p></section>
+{% endblock %}

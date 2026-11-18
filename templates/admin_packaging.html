@@ -1,0 +1,28 @@
+{% extends 'base.html' %}
+{% block title %}Packaging quotes ? Harvest Pool{% endblock %}
+{% block content %}
+<h1>Packaging quote review</h1>
+<p>Record indicative quotes and planning status. Confirm capacity before arranging physical fulfilment.</p>
+<div class="pilot-grid">
+{% for q in quotes %}
+  <article class="workspace-card" id="quote-{{ q.id }}">
+    <span class="state-pill">{{ q.status }}</span><h2>#{{ q.id }} ? {{ q.crop }}</h2>
+    <p>{{ q.farmer_name }} ? <a href="{{ url_for('produce_detail', listing_id=q.listing_id) }}">Listing #{{ q.listing_id }}</a></p>
+    <p>{{ services[q.service] }} ? {{ q.quantity_kg }} kg ? {{ q.labelled_units }} labelled units{% if q.new_design %} ? New design{% endif %}</p>
+    <p class="pilot-notes">{{ q.requirements }}</p>
+    <p>Initial estimate <strong>R{{ '%.2f'|format(q.estimate_cents/100) }}</strong></p>
+    {% if q.review_note %}<p>Latest review ? {{ q.review_note }}</p>{% endif %}
+    {% if q.quote_cents is not none %}<p>Reviewed quote ? R{{ '%.2f'|format(q.quote_cents/100) }}</p>{% endif %}
+    {% if transitions[q.status] %}
+    <form class="modern-form" method="post" action="{{ url_for('review_packaging', quote_id=q.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="revision" value="{{ q.revision }}">
+      <label>Decision<select name="status" required>{% for status in transitions[q.status] %}<option>{{ status }}</option>{% endfor %}</select></label>
+      <label>Quote amount (R), used when setting Quoted<input type="number" name="amount" min="0" max="100000000" step=".01" value="{{ '%.2f'|format((q.quote_cents if q.quote_cents is not none else q.estimate_cents)/100) }}"></label>
+      <label>Reason or farmer instructions<textarea name="note" minlength="10" maxlength="500" required rows="3"></textarea></label>
+      <button class="action-main">Record decision</button>
+    </form>
+    {% endif %}
+  </article>
+{% else %}<p>Farmer quote requests will appear here.</p>{% endfor %}
+</div>
+{% endblock %}

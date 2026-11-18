@@ -1,0 +1,52 @@
+{% extends 'base.html' %}
+{% block title %}Packaging &amp; branding ? Harvest Pool{% endblock %}
+{% block content %}
+{% include 'packaging_intro.html' %}
+<section class="pilot-section">
+  <h1>Packaging &amp; branding pilot</h1>
+  <p>Choose a format for your buyer. Quotes, capacity and fulfilment require confirmation with potential service partners. Prices are indicative pilot assumptions in South African rand.</p>
+  <div class="pilot-grid">
+    <article class="workspace-card"><h2>Packaging</h2><strong>From R{{ rates.pack_price }}/kg</strong><p>Specify bags, punnets or cartons, pack size and handling needs.</p></article>
+    <article class="workspace-card"><h2>Branding</h2><strong>From R{{ rates.label_price }}/labelled unit</strong><p>Request labels with crop, grower and batch details suited to your buyer?s requirements.</p></article>
+    <article class="workspace-card"><h2>Artwork</h2><strong>R{{ rates.art_price }}/new design</strong><p>Request a new design, or include the reference for existing artwork.</p></article>
+  </div>
+</section>
+<section id="service-requests" class="pilot-section">
+  {% if current_user.is_authenticated and current_user.role == 'farmer' %}
+    {% if listings %}
+    <form class="modern-form workspace-card" method="post" action="{{ url_for('request_packaging') }}" id="quote-form"
+          data-pack="{{ rates.pack_price }}" data-label="{{ rates.label_price }}" data-art="{{ rates.art_price }}">
+      <h2>Request packaging &amp; branding</h2>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Your listing<select name="listing_id" required>{% for row in listings %}<option value="{{ row.id }}" data-stock="{{ row.available_kg }}">{{ row.crop }} ? {{ row.available_kg }} kg available ? #{{ row.id }}</option>{% endfor %}</select></label>
+      <div class="form-pair">
+        <label>Service<select name="service">{% for key, label in services.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></label>
+        <label>Produce quantity (kg)<input name="quantity_kg" type="number" min="0.01" max="1000000" step="0.01" required></label>
+      </div>
+      <div class="form-pair">
+        <label>Labelled units<input name="labelled_units" type="number" min="0" max="1000000" step="1" value="0"></label>
+        <label class="checkline"><input type="checkbox" name="new_design" value="yes"> Request a new artwork design</label>
+      </div>
+      <label>Requirements<textarea name="requirements" required minlength="10" maxlength="1000" rows="4" placeholder="Example: 2 kg bags, 50 printed labels, reuse the existing Vhembe Growers artwork"></textarea></label>
+      <p><strong>Indicative service estimate <output id="quote-estimate" aria-live="polite">R0.00</output></strong></p>
+      <p>Submitting sends a request for review. Stock stays available and no payment is collected.</p>
+      <button class="action-main">Submit quote request</button>
+    </form>
+    <script src="{{ url_for('static', filename='js/packaging.js') }}" defer></script>
+    {% else %}<p><a href="{{ url_for('dashboard') }}#new-listing">Add a listing with available stock</a> to request a quote.</p>{% endif %}
+    <h2>Your requests</h2>
+    <div class="pilot-grid">
+      {% for q in quotes %}
+      <article class="workspace-card">
+        <span class="state-pill">{{ q.status }}</span><h3>#{{ q.id }} ? {{ q.crop }}</h3>
+        <p>{{ services[q.service] }} ? {{ q.quantity_kg }} kg ? {{ q.labelled_units }} labelled units</p>
+        <p>Estimate R{{ '%.2f'|format(q.estimate_cents / 100) }}{% if q.quote_cents is not none %} ? Reviewed quote R{{ '%.2f'|format(q.quote_cents / 100) }}{% endif %}</p>
+        {% if q.review_note %}<p>{{ q.review_note }}</p>{% endif %}
+      </article>
+      {% else %}<p>Your submitted quote requests will appear here.</p>{% endfor %}
+    </div>
+  {% elif not current_user.is_authenticated %}
+    <a class="action-main" href="{{ url_for('login') }}">Sign in as a farmer to request a quote</a>
+  {% else %}<p>Farmer accounts can request quotes against their own listings.</p>{% endif %}
+</section>
+{% endblock %}
