@@ -1602,6 +1602,119 @@ def admin_review_seller(farmer_id):
     return redirect(url_for('admin_dashboard'))
 
 
+
+# Phase 13 — public, read-only voice-assisted discovery. Voice/AI cannot place orders,
+# change accounts, modify inventory, or initiate payment actions.
+SPOKEN_LANGUAGES = {
+    'en-ZA': 'English', 'af-ZA': 'Afrikaans', 'zu-ZA': 'isiZulu',
+    'xh-ZA': 'isiXhosa', 'nso-ZA': 'Sepedi', 'st-ZA': 'Sesotho',
+    'tn-ZA': 'Setswana', 'ss-ZA': 'siSwati', 'nr-ZA': 'isiNdebele',
+    'ts-ZA': 'itsonga', 've-ZA': 'Tshivenda'
+}
+
+@app.get('/api/discover')
+@limiter.limit('40 per minute')
+def discover_produce():
+    term = request.args.get('q', '').strip()[:70]
+    db = get_db()
+    try:
+        query = active_supply_query()
+        params = [date.today().isoformat()]
+        if term:
+            query += ' AND (p.crop LIKE ? OR f.village LIKE ?)'
+            params.extend(['%' + term + '%', '%' + term + '%'])
+        query += ' ORDER BY p.id DESC LIMIT 9'
+        rows = db.execute(query, params).fetchall()
+        items = [{
+            'id': r['id'], 'crop': r['crop'], 'village': r['village'],
+            'price': round(float(r['asking_price']), 2),
+            'available_kg': round(float(r['available_kg']), 2),
+            'photo_url': url_for('produce_photo', listing_id=r['id']) if r['photo_filename'] else None,
+            'detail_url': url_for('produce_detail', listing_id=r['id']),
+        } for r in rows]
+        return jsonify({'items': items, 'count': len(items)})
+    finally:
+        db.close()
+
+
+def assistant_fallback(question, language, crops):
+    q = question.casefold()
+    if any(word in q for word in ('register', 'join', 'account', 'sign up', 'bhalisa')):
+        message = 'To get started, select Create account, then choose Farmer or Buyer. I can help you find the page.'
+        url = url_for('register')
+    elif any(word in q for word in ('sell', 'seller', 'farmer', 'harvest', 'venda', 'tshimu')):
+        message = 'Farmers can create an account, list produce, and approve buyer offers themselves. Open registration to begin.'
+        url = url_for('register')
+    elif any(word in q for word in ('pay', 'payment', 'money', 'payout')):
+        message = 'Buyers can review combined orders and pay through supported checkout. Farmer payout features are not yet available. For your safety, do not share card details in this chat.'
+        url = url_for('marketplace')
+    else:
+        count = len(crops)
+        message = (f'I found {count} currently available produce listings matching your search. ' if count else 'I could not find matching produce right now. ') + 'You can open the marketplace to explore produce and locations.'
+        url = url_for('marketplace', q=question[:60])
+    return {'answer': message, 'suggested_url': url, 'ai_active': False}
+
+
+@app.post('/api/assistant/ask')
+@limiter.limit('12 per minute')
+def ask_assistant():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'Invalid request'}), 400
+    question = str(payload.get('message', '')).strip()[:350]
+    language = str(payload.get('language', 'en-ZA'))
+    if not question or language not in SPOKEN_LANGUAGES:
+        return jsonify({'error': 'Select a language and enter a question.'}), 400
+    # No private account or contact information is exposed to the AI.
+    db = get_db()
+    try:
+        rows = db.execute(active_supply_query() + ' ORDER BY p.id DESC LIMIT 18',
+                          (date.today().isoformat(),)).fetchall()
+        crops = [{'crop': r['crop'], 'village': r['village'],
+                  'price_per_kg_zar': float(r['asking_price']),
+                  'quantity_kg': float(r['available_kg'])} for r in rows]
+    finally:
+        db.close()
+    fallback = assistant_fallback(question, language, crops)
+    key = os.getenv('OPENAI_API_KEY', '').strip()
+    if not key:
+        return jsonify(fallback)
+    try:
+        # Optional AI connector. Remote text service; not a streaming audio agent.
+        result = requests.post(
+            'https://api.openai.com/v1/responses',
+            headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'},
+            json={
+                'model': os.getenv('HARVEST_AI_MODEL', 'gpt-5-mini'),
+                'store': False,
+                'max_output_tokens': 230,
+                'instructions': (
+                    'You are the Harvest Pool agricultural marketplace voice assistant. '
+                    'Reply briefly, warmly and clearly in ' + SPOKEN_LANGUAGES[language] + '. '
+                    'Speak simply for people unfamiliar with smartphones. '
+                    'Use only the supplied real listing data for availability, prices, or locations. '
+                    'Never invent inventory, seller verification, payments, cultural facts, or availability. '
+                    'Never ask for passwords, card numbers, ID numbers or bank details. '
+                    'Never claim to place an order or transfer funds. '
+                    'For buying direct user to the marketplace; for selling, to registration. '
+                    'If the language is unsupported, say so in English instead of pretending fluency.'
+                ),
+                'input': 'Available listings JSON: ' + json.dumps(crops, ensure_ascii=False) +
+                         '\nUser question: ' + question
+            }, timeout=15
+        )
+        result.raise_for_status()
+        data = result.json()
+        parts = [part.get('text','') for out in data.get('output', [])
+                 for part in out.get('content', []) if part.get('type') == 'output_text']
+        answer = ' '.join(parts).strip()[:1600]
+        if not answer:
+            raise ValueError('Empty assistant answer')
+        return jsonify({'answer': answer, 'suggested_url': fallback['suggested_url'], 'ai_active': True})
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        app.logger.warning('Assistant external service unavailable: %s', type(exc).__name__)
+        return jsonify(fallback)
+
 init_db()
 
 if __name__ == '__main__':
