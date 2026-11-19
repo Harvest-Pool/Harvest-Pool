@@ -1,18 +1,18 @@
 {% extends 'base.html' %}
-{% block title %}Packaging quotes ? Harvest Pool{% endblock %}
+{% block title %}Packaging quotes · Harvest Pool{% endblock %}
 {% block content %}
 <h1>Packaging quote review</h1>
 <p>Record indicative quotes and planning status. Confirm capacity before arranging physical fulfilment.</p>
 <div class="pilot-grid">
 {% for q in quotes %}
   <article class="workspace-card" id="quote-{{ q.id }}">
-    <span class="state-pill">{{ _(q.status) }}</span><h2>#{{ q.id }} ? {{ q.crop }}</h2>
-    <p>{{ q.farmer_name }} ? <a href="{{ url_for('produce_detail', listing_id=q.listing_id) }}">Listing #{{ q.listing_id }}</a></p>
-    <p>{{ services[q.service] }} ? {{ q.quantity_kg }} kg ? {{ q.labelled_units }} labelled units{% if q.new_design %} ? New design{% endif %}</p>
+    <span class="state-pill">{{ _(q.status) }}</span><h2>#{{ q.id }} · {{ q.crop }}</h2>
+    <p>{{ q.farmer_name }} · <a href="{{ url_for('produce_detail', listing_id=q.listing_id) }}">Listing #{{ q.listing_id }}</a></p>
+    <p>{{ services[q.service] }} · {{ q.quantity_kg }} kg · {{ q.labelled_units }} labelled units{% if q.new_design %} · New design{% endif %}</p>
     <p class="pilot-notes">{{ q.requirements }}</p>
     <p>Initial estimate <strong>R{{ '%.2f'|format(q.estimate_cents/100) }}</strong></p>
-    {% if q.review_note %}<p>Latest review ? {{ q.review_note }}</p>{% endif %}
-    {% if q.quote_cents is not none %}<p>Reviewed quote ? R{{ '%.2f'|format(q.quote_cents/100) }}</p>{% endif %}
+    {% if q.review_note %}<p>Latest review · {{ q.review_note }}</p>{% endif %}
+    {% if q.quote_cents is not none %}<p>Reviewed quote · R{{ '%.2f'|format(q.quote_cents/100) }}</p>{% endif %}
     {% if transitions[q.status] %}
     <form class="modern-form" method="post" action="{{ url_for('review_packaging', quote_id=q.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="revision" value="{{ q.revision }}">

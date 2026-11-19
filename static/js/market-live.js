@@ -23,7 +23,7 @@
     const controller = new AbortController();
     pending = controller;
     results.setAttribute('aria-busy', 'true');
-    feedback.textContent = 'Finding produce?';
+    feedback.textContent = section.dataset.loading;
     try {
       const response = await fetch(url, {signal: controller.signal});
       if (!response.ok) throw new Error('Marketplace request failed');

@@ -1,8 +1,8 @@
-const menu = document.querySelector('.site-menu-toggle');
-const navigation = document.getElementById('site-navigation');
-
-if (menu && navigation) {
-  const compact = window.matchMedia('(max-width: 780px)');
+function setupMenu(trigger, navigationId, breakpoint) {
+  const menu = document.querySelector(trigger);
+  const navigation = document.getElementById(navigationId);
+  if (!menu || !navigation) return;
+  const compact = window.matchMedia(breakpoint);
 
   function setMenu(open) {
     navigation.hidden = compact.matches && !open;
@@ -23,10 +23,16 @@ if (menu && navigation) {
     }
   });
   navigation.addEventListener('click', event => {
-    if (compact.matches && event.target.closest('a')?.hash) setMenu(false);
+    if (compact.matches && event.target.closest('a')?.hash) {
+      setMenu(false);
+      menu.focus({preventScroll: true});
+    }
   });
   resetMenu();
 }
+
+setupMenu('.site-header .site-menu-toggle', 'site-navigation', '(max-width: 1120px)');
+setupMenu('.workspace-menu-toggle', 'workspace-navigation', '(max-width: 950px)');
 
 document.querySelectorAll('.pilot-visual').forEach(visual => {
   const controls = visual.querySelector('.pilot-controls');
