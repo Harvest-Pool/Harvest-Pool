@@ -9,7 +9,7 @@
 </div>
 {% endmacro %}
 {% block content %}
-<h1>Financial planning</h1>
+<h1>{{ _('Financial planning') }}</h1>
 <p>Illustrative monthly projections in ZAR. Produce proceeds pass through to farmers. Service rates are pilot assumptions and coordination fees are excluded from test checkout.</p>
 <nav class="pilot-tabs" aria-label="Financial scenarios">
 {% for key in scenarios %}<a href="{{ url_for('finance', scenario=key) }}" {% if key == scenario %}aria-current="page"{% endif %}>{{ {'base':'Base case','conservative':'Conservative','growth':'Growth'}[key] }}</a>{% endfor %}

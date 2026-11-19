@@ -96,7 +96,10 @@ class HarvestPoolTests(unittest.TestCase):
         route = f"/admin/sellers/{farmer_id}/review"
         self.form(self.admin, route, dict(decision="Approved", note="Synthetic fixture account"))
         self.assertEqual(self.row("SELECT verification_status FROM farmers WHERE id=?", farmer_id)[0], "Pending")
-        self.form(self.admin, route, dict(decision="Approved", note="Synthetic fixture independently confirmed", attest="yes"))
+        self.execute("UPDATE farmers SET demo_account=1 WHERE id=?", farmer_id)
+        with patch.dict(self.app.config, {"DEMO_MODE": True}):
+            self.form(self.admin, route, dict(decision="Approved", note="Synthetic fixture independently confirmed",
+                                              demo_attest="yes"))
         self.assertEqual(self.row("SELECT verification_status FROM farmers WHERE id=?", farmer_id)[0], "Approved")
 
     def test_seller_review_search_expiry_photo_auth_and_csrf(self):
@@ -256,6 +259,222 @@ class HarvestPoolTests(unittest.TestCase):
         self.assertIn(b"From R3.00/kg", farmer.get("/packaging").data)
         self.assertEqual(self.row("SELECT estimate_cents FROM packaging_quotes")[0], 45000)
 
+    def test_verification_privacy_approval_and_expiry(self):
+        from cryptography.fernet import Fernet
+        from seller_verification import today
+
+        farmer, farmer_id = self.account("farmer", 1)
+        other, other_id = self.account("farmer", 2)
+        buyer, _ = self.account("buyer", 3)
+        listing = self.listing(farmer, farmer_id, photo=True)
+        other_listing = self.listing(other, other_id)
+        day = today()
+        expiry = (day + timedelta(days=14)).isoformat()
+
+        def image():
+            stream = io.BytesIO()
+            Image.new("RGB", (20, 20), "#a26f3c").save(stream, "PNG")
+            stream.write(b"private-appended-marker")
+            stream.seek(0)
+            return stream, "identity.png"
+
+        def decide(case, **extra):
+            fields = {"decision":"Approved", "reason":"Independent verification witnessed and recorded.",
+                      "revision":0,"expires_on":expiry} | extra
+            return self.form(self.admin, f"/admin/verification/{case}", fields)
+
+        with tempfile.TemporaryDirectory() as vault, patch.dict(self.app.config, {
+            "KYC_PRIVATE_DIR":vault,"KYC_ENCRYPTION_KEY":Fernet.generate_key(),
+            "KYC_REVIEWERS":{"admin@demo.invalid"},"KYC_CONTROLLER":"Synthetic test",
+            "KYC_PRIVACY_CONTACT":"privacy@example.invalid","KYC_BASIS":"contract",
+        }):
+            self.assertEqual(farmer.get("/verification").status_code,200)
+            self.assertEqual(buyer.get("/verification").status_code,403)
+            identity = dict(route="document",document_type="sa-id",privacy_notice="read")
+            self.form(farmer,"/verification/identity",
+                      identity | {"evidence":(io.BytesIO(b"not a photo"),"id.png")})
+            self.assertEqual(self.row("SELECT count(*) FROM kyc_cases")[0],0)
+            self.form(farmer,"/verification/identity",identity | {"evidence":image()})
+            case=self.row("SELECT id FROM kyc_cases")[0]
+            self.assertNotIn(b"private-appended-marker", next(Path(vault).glob("*.sealed")).read_bytes())
+            path=f"/verification/evidence/{case}/0"
+            for client in (buyer,other,self.app.test_client()):
+                self.assertEqual(client.get(path).status_code,404)
+            self.assertEqual(farmer.get(path).status_code,200)
+            admin_image=self.admin.get(path)
+            self.assertEqual(admin_image.status_code,200)
+            self.assertEqual(admin_image.mimetype,"image/jpeg")
+            self.assertTrue(admin_image.cache_control.no_store)
+            self.assertNotIn(b"private-appended-marker",admin_image.data)
+            with patch.dict(self.app.config, {"KYC_REVIEWERS":set()}):
+                self.assertEqual(self.admin.get(path).status_code,403)
+                self.assertEqual(self.admin.get(f"/admin/verification/{case}").status_code,403)
+            self.assertEqual(decide(case,primary_check="yes").status_code,400)
+            self.assertEqual(decide(case,primary_check="yes",independent_check="yes").status_code,302)
+            self.assertEqual(self.row("SELECT verification_status FROM farmers WHERE id=?",farmer_id)[0],"Pending")
+            self.assertEqual(buyer.get(f"/produce/{listing}").status_code,404)
+            batch = dict(privacy_notice="read",listing_id=other_listing,batch="LOT-20",declaration="Seller declaration",evidence=image())
+            self.assertEqual(self.form(farmer,"/verification/batch",batch).status_code,404)
+            supply = dict(privacy_notice="read",location="private production coordinates",
+                          relationship="communal",photo_date=day.isoformat(),harvest_date=day.isoformat(),
+                          quantity=300,evidence=image())
+            self.form(farmer,"/verification/supply",supply)
+            supply_case=self.row("SELECT id FROM kyc_cases WHERE dimension='supply'")[0]
+            self.assertEqual(self.admin.get(f"/admin/verification/{supply_case}").status_code,200)
+            self.assertEqual(decide(supply_case,primary_check="yes",independent_check="yes").status_code,302)
+            html=buyer.get(f"/produce/{listing}").data
+            self.assertIn(b"Seller verified",html)
+            self.assertNotIn(b"Stock independently checked",html)
+            self.assertNotIn(b"Grade independently verified",html)
+            self.assertNotIn(b"private production coordinates",html)
+            self.form(farmer,"/verification/batch",batch | {"listing_id":listing, "evidence":image()})
+            batch_case=self.row("SELECT id FROM kyc_cases WHERE dimension='batch'")[0]
+            self.assertEqual(decide(batch_case,grade="Class 1",grade_check="yes").status_code,400)
+            self.assertEqual(decide(batch_case,stock_check="yes").status_code,302)
+            html=buyer.get(f"/produce/{listing}").data
+            self.assertIn(b"Stock independently checked",html)
+            self.assertNotIn(b"Grade independently verified",html)
+            self.form(farmer, "/verification/batch", batch | {"listing_id":listing, "evidence":image(),
+                      "issuer":"Synthetic inspector","reference":"SYN-CLASS-1","certificate_date":expiry})
+            grade_case=self.row("SELECT MAX(id) FROM kyc_cases WHERE dimension='batch'")[0]
+            self.assertEqual(decide(grade_case,grade="Class 1",grade_check="yes").status_code,302)
+            html=buyer.get(f"/produce/{listing}").data
+            self.assertIn(b"Grade independently verified",html)
+            self.assertNotIn(b"SYN-CLASS-1",html)
+            self.assertNotIn(b"Stock independently checked",html)
+            runner=self.app.test_cli_runner()
+            self.assertEqual(runner.invoke(args=["purge-verification-evidence","--case-id",str(grade_case)]).exit_code,0)
+            self.assertEqual(runner.invoke(args=["purge-verification-evidence","--case-id",str(grade_case),"--apply"]).exit_code,0)
+            self.assertEqual(farmer.get(f"/verification/evidence/{grade_case}/0").status_code,404)
+            self.execute("UPDATE kyc_cases SET expires_on='2000-01-01' WHERE id=?",supply_case)
+            self.assertEqual(buyer.get(f"/produce/{listing}").status_code,404)
+            self.assertIn(b"Expired",farmer.get("/verification").data)
+            supply["evidence"]=image()
+            self.assertEqual(self.form(farmer,"/verification/supply",supply).status_code,302)
+            self.assertEqual(self.row("SELECT count(*) FROM kyc_cases WHERE dimension='supply'")[0],2)
+            self.assertGreater(self.row("SELECT count(*) FROM kyc_events")[0],5)
+            self.assertEqual(self.form(farmer,"/verification/privacy",{"kind":"deletion"}).status_code,302)
+            self.assertEqual(self.row("SELECT kind FROM kyc_privacy_requests")[0],"deletion")
+
+    def test_free_resource_limits_and_reactivation(self):
+        farmer, farmer_id = self.account("farmer", 1)
+        self.assertIn(b"Current plan", farmer.get("/dashboard").data)
+        self.assertIn(b"Free", farmer.get("/subscription").data)
+        expired = self.listing(farmer, farmer_id)
+        self.execute("UPDATE produce_listings SET available_until='2000-01-01' WHERE id=?", expired)
+        for crop in ("Onions", "Potatoes", "Tomatoes"):
+            self.listing(farmer, farmer_id, crop=crop)
+        payload = dict(crop="Carrots", quantity_kg=100, asking_price=15, quality="Grade A",
+                       harvest_date=self.today, available_until=self.expiry)
+        self.assertEqual(self.form(farmer, "/produce/add", payload).location, "/subscription")
+        self.assertEqual(self.form(farmer, f"/produce/{expired}/availability",
+                                   {"available_until": self.expiry}).location, "/subscription")
+        self.assertEqual(self.row("SELECT count(*) FROM produce_listings")[0], 4)
+        buyer, buyer_id = self.account("buyer", 2)
+        demand = dict(crop="Potatoes", quantity_kg=100, target_price=15,
+                      deadline=self.expiry, delivery_location="Vhembe")
+        for _ in range(2):
+            self.assertEqual(self.form(buyer, "/demands/add", demand).location, "/dashboard")
+        self.assertEqual(self.form(buyer, "/demands/add", demand).location, "/subscription")
+        self.assertEqual(self.row("SELECT count(*) FROM buyer_demands WHERE buyer_id=?", buyer_id)[0], 2)
+        self.assertEqual(buyer.get("/subscription/report.csv").status_code, 403)
+        self.assertEqual(buyer.get("/admin/subscriptions").status_code, 403)
+        self.assertEqual(self.admin.get("/subscription").status_code, 403)
+
+    def test_mock_subscription_isolated_failure_retry_cancellation_and_expiry(self):
+        farmer, farmer_id = self.account("farmer", 1)
+        buyer, _ = self.account("buyer", 2)
+        form = {"reference": "a" * 32, "plan": "farmer-pro", "outcome": "mock_success"}
+        with patch.dict(self.app.config, {"DEMO_MODE": True, "SUBSCRIPTION_DEMO": True}):
+            self.assertEqual(self.form(farmer, "/subscription/mock", form).status_code, 403)
+            self.execute("INSERT INTO subscription_demo VALUES (1)")
+            self.assertEqual(self.form(buyer, "/subscription/mock", form).status_code, 403)
+            self.assertEqual(farmer.post("/subscription/mock", data=form).status_code, 400)
+            failed = form | {"outcome": "mock_failure"}
+            self.form(farmer, "/subscription/mock", failed)
+            self.form(farmer, "/subscription/mock", form)
+            self.assertEqual(self.row("SELECT count(*) FROM subscription_periods")[0], 0)
+            success = form | {"reference": "b" * 32}
+            for _ in range(2):
+                self.assertEqual(self.form(farmer, "/subscription/mock", success).status_code, 302)
+            self.assertEqual(self.row("SELECT count(*) FROM subscription_attempts")[0], 2)
+            self.assertEqual(self.row("SELECT count(*) FROM subscription_periods")[0], 1)
+            self.assertIn(b"Farmer Pro", farmer.get("/subscription").data)
+            self.assertEqual(farmer.get("/subscription/tools").status_code, 200)
+            self.assertNotIn(b"mock-", buyer.get("/subscription").data)
+            for index in range(4):
+                self.listing(farmer, farmer_id, crop=f"Crop {index}")
+            with farmer.get("/subscription/report.csv") as csv_report:
+                self.assertEqual(csv_report.status_code, 200)
+                self.assertIn(b"Crop 3", csv_report.data)
+            self.form(farmer, "/subscription/cancel", {})
+            self.form(farmer, "/subscription/cancel", {})
+            self.assertEqual(self.row("SELECT cancel_renewal FROM subscription_periods")[0], 1)
+            self.assertEqual(self.row("SELECT count(*) FROM subscription_events WHERE kind='mock_cancel_renewal'")[0], 1)
+            self.assertEqual(farmer.get("/subscription/tools").status_code, 200)
+            self.assertEqual(self.admin.get("/admin/subscriptions").status_code, 200)
+            with patch.dict(self.app.config, {"SUBSCRIPTION_DEMO": False}):
+                self.assertEqual(farmer.get("/subscription/tools").status_code, 403)
+            self.execute("UPDATE subscription_periods SET starts_on='2000-01-01',ends_on='2000-02-01'")
+            self.assertEqual(farmer.get("/subscription/tools").status_code, 403)
+            self.assertEqual(self.row("SELECT count(*) FROM produce_listings")[0], 4)
+            over_limit = dict(crop="Carrots", quantity_kg=100, asking_price=15, quality="Grade A",
+                              harvest_date=self.today, available_until=self.expiry)
+            self.assertEqual(self.form(farmer, "/produce/add", over_limit).location, "/subscription")
+
+    def test_buyer_pro_saved_template_and_profile_ownership(self):
+        buyer, buyer_id = self.account("buyer", 1)
+        other, other_id = self.account("buyer", 2)
+        self.form(buyer, "/account", {"name": "Buyer Contact", "place": "Sibasa", "profile_id": other_id})
+        self.assertEqual(self.row("SELECT location FROM buyers WHERE id=?", buyer_id)[0], "Sibasa")
+        self.assertNotIn(b"Buyer Contact", other.get("/account").data)
+        self.execute("INSERT INTO subscription_demo VALUES (1)")
+        with patch.dict(self.app.config, {"DEMO_MODE": True, "SUBSCRIPTION_DEMO": True}):
+            self.form(buyer, "/subscription/mock", {"reference": "c"*32, "plan": "buyer-pro",
+                                                   "outcome": "mock_success"})
+            fields = dict(crop="Potatoes", place="Sibasa", quantity="120", target_price="14", notify="yes")
+            self.assertEqual(self.form(buyer, "/subscription/tools", fields).status_code, 302)
+            page = buyer.get("/subscription/tools").data
+            self.assertIn(b"Repeat sourcing request", page)
+            self.assertIn(b'name="delivery_location" type="hidden" value="Sibasa"', page)
+            self.assertEqual(other.get("/subscription/tools").status_code, 403)
+            self.assertIn(b"produce_value_cents", buyer.get("/subscription/report.csv").data)
+
+    def test_subscription_plan_edits_and_guide_allowance(self):
+        buyer, _ = self.account("buyer", 1)
+        fields = dict(code="free", farmer_limit=3, buyer_limit=2, guide_daily=1)
+        self.assertEqual(self.form(buyer, "/admin/subscriptions", fields).status_code, 403)
+        self.assertEqual(self.form(self.admin, "/admin/subscriptions", fields).status_code, 302)
+        self.assertEqual(self.row("SELECT count(*) FROM subscription_events WHERE kind='plan_updated'")[0], 1)
+        token = re.search(rb'name="csrf-token" content="([^"]+)"', buyer.get("/").data).group(1).decode()
+        for code in (200, 429):
+            answer = buyer.post("/api/assistant/ask", json={"message": "How does pooling work?"},
+                                headers={"X-CSRFToken": token})
+            self.assertEqual(answer.status_code, code)
+
+    def test_locale_switching_persists_and_preserves_market_data(self):
+        guest = self.app.test_client()
+        destination = "/marketplace?q=Potatoes&sort=price-asc"
+        change = self.form(guest, "/language", {"locale": "zu-ZA", "return_to": destination})
+        self.assertEqual(change.status_code, 303)
+        self.assertEqual(change.location, destination)
+        marketplace = guest.get(destination).data
+        self.assertIn(b'<html lang="zu-ZA">', marketplace)
+        self.assertIn(b"Sebenzisa izihlungi", marketplace)
+        self.assertIn(b'data-site-locale="zu-ZA"', marketplace)
+        self.assertEqual(guest.post("/language", data={"locale": "ve-ZA"}).status_code, 400)
+        change = self.form(guest, "/language", {"locale": "xh-ZA", "return_to": "//example.com"})
+        self.assertEqual(change.location, "/")
+        self.assertIn(b"interface translation is unavailable", guest.get("/").data)
+        self.assertEqual(self.form(guest, "/language", {"locale": "invalid"}).status_code, 400)
+        buyer, _ = self.account("buyer", 1)
+        self.form(buyer, "/language", {"locale": "ve-ZA", "return_to": "/dashboard"})
+        self.assertIn(b'<html lang="ve-ZA">', buyer.get("/dashboard").data)
+        independent = self.login("buyer1@demo.invalid")
+        self.assertIn(b"Mutengo", independent.get("/dashboard").data)
+        self.assertEqual(self.row("SELECT preferred_locale FROM users")[0], "ve-ZA")
+        self.assertEqual(independent.get("/accessibility").status_code, 200)
+
     def test_assistant_languages_and_provider_error(self):
         client = self.app.test_client()
         token = re.search(rb'name="csrf-token" content="([^"]+)"', client.get("/").data).group(1).decode()
@@ -272,7 +491,8 @@ class HarvestPoolTests(unittest.TestCase):
         self.assertEqual(ask("ve-ZA", "Vhalimi vha nga tanganya zwibveledzwa hani?").json["answer"],
                          local.json["answer"])
         self.assertFalse(local.json["ai_active"])
-        self.assertEqual(ask("zu-ZA", "Sawubona").status_code, 503)
+        self.assertEqual(ask("xh-ZA", "Molo").status_code, 503)
+        self.assertIn("Abalimi abaningana", ask("zu-ZA", "Ngingahlanganisa izivuno kanjani?").json["answer"])
         self.assertEqual(ask({}, "bad language type").status_code, 400)
         with patch.dict(os.environ, {"HARVEST_ROTATED_OPENAI_KEY": "injected-test-placeholder"}):
             with patch.object(requests, "post") as post:

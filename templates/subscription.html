@@ -1,0 +1,39 @@
+{% extends 'base.html' %}
+{% block title %}{{ _('My subscription') }} · Harvest Pool{% endblock %}
+{% block content %}
+<section class="pilot-section plan-section">
+  <h1>{{ _('My subscription') }}</h1>
+  <article class="workspace-card">
+    <h2>{{ _('Current plan') }} · {{ _(plan.name) }}</h2>
+    {% set limit = plan[current_user.role ~ '_limit'] %}
+    <p>{{ count }} {{ 'active listings' if current_user.role == 'farmer' else 'active requests' }}{% if limit %} / {{ limit }}{% endif %}.</p>
+    <p>When a Pro period ends, your account returns to Free. Existing listings, requests and orders remain accessible. You can add active records again once your usage is below the Free limit.</p>
+    {% if period %}
+      <p>Simulated access until <time datetime="{{ period.ends_on }}">{{ period.ends_on }}</time> (exclusive). No automatic charge will occur.</p>
+      <a class="action-main" href="{{ url_for('subscription_tools') }}">Open Pro tools</a>
+      {% if period.cancel_renewal %}<p>Renewal cancellation recorded.</p>{% else %}
+      <form method="post" action="{{ url_for('cancel_subscription') }}"><input name="csrf_token" type="hidden" value="{{ csrf_token() }}"><button class="action-soft">{{ _('Cancel renewal') }}</button></form>{% endif %}
+    {% endif %}
+  </article>
+  {% if demo_enabled and not period %}
+    <form class="workspace-card modern-form pilot-space" method="post" action="{{ url_for('mock_subscription') }}">
+      <h2>{{ proposed.name }} · {{ zar_cents(proposed.price_cents) }} / month</h2>
+      <p>Mock billing. Simulate a month of access or a payment failure without entering payment details.</p>
+      <input name="csrf_token" type="hidden" value="{{ csrf_token() }}">
+      <input name="reference" type="hidden" value="{{ reference }}">
+      <input name="plan" type="hidden" value="{{ proposed.code }}">
+      <div class="plan-buttons"><button class="action-main" name="outcome" value="mock_success">Simulate upgrade</button>
+      <button class="action-soft" name="outcome" value="mock_failure">Simulate failed payment</button></div>
+    </form>
+  {% elif not demo_enabled %}
+    <p>Paid upgrades are unavailable. <a href="{{ url_for('pricing') }}">Compare plans</a>.</p>
+  {% endif %}
+  <section class="workspace-card pilot-space"><h2>{{ _('Billing history') }}</h2>
+  {% if attempts %}
+    <div class="pilot-table"><table><thead><tr><th>{{ _('Date') }}</th><th>{{ _('Plan') }}</th><th>Simulated amount</th><th>Result</th><th>{{ _('Reference') }}</th></tr></thead><tbody>
+    {% for a in attempts %}<tr><td>{{ a.created_at }}</td><td>{{ _(a.name) }}</td><td>{{ zar_cents(a.amount_cents) }}</td><td>{{ 'Mock success' if a.outcome == 'mock_success' else 'Mock failure' }}</td><td>{{ a.reference }}</td></tr>{% endfor %}
+    </tbody></table></div>
+  {% else %}<p>No billing attempts yet.</p>{% endif %}
+  </section>
+</section>
+{% endblock %}

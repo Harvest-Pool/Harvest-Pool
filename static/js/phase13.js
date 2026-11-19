@@ -18,12 +18,18 @@
     soundButton.setAttribute('aria-pressed', String(sound));
     soundButton.textContent = sound ? 'Read answers aloud: On' : 'Read answers aloud: Off';
   }
+  const siteLocale = lang.dataset.siteLocale || 'en-ZA';
+  lang.value = siteLocale;
   try {
-    const saved = localStorage.getItem('harvest-guide-language');
-    if (Array.from(lang.options).some(option => option.value === saved)) lang.value = saved;
+    const saved = JSON.parse(localStorage.getItem('harvest-guide-language'));
+    if (saved?.site === siteLocale && Array.from(lang.options).some(option => option.value === saved.choice)) {
+      lang.value = saved.choice;
+    }
   } catch {}
   lang.addEventListener('change', () => {
-    try { localStorage.setItem('harvest-guide-language', lang.value); } catch {}
+    try {
+      localStorage.setItem('harvest-guide-language', JSON.stringify({site: siteLocale, choice: lang.value}));
+    } catch {}
     recognition?.abort();
     window.speechSynthesis?.cancel();
     chat.replaceChildren();

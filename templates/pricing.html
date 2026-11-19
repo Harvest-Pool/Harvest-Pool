@@ -1,0 +1,32 @@
+{% extends 'base.html' %}
+{% block title %}{{ _('Pricing') }} · Harvest Pool{% endblock %}
+{% block content %}
+<section class="pilot-section plan-section">
+  <h1>{{ _('Pricing') }}</h1>
+  <p>List crops, source produce and complete pooled orders on Free. Proposed Pro plans add tools for larger inventories and regular procurement.</p>
+  <p class="notice">Pro upgrades are available only as a local billing simulation. No card is charged.</p>
+  <div class="pilot-grid">
+  {% for p in plans %}
+    <article class="workspace-card plan-card">
+      <h2>{{ _(p.name) }}</h2><div class="plan-price">{{ zar_cents(p.price_cents) }} <small>/ month</small></div>
+      <ul>
+        {% if p.code == 'free' %}
+          <li>{{ p.farmer_limit }} active listings per farmer</li><li>{{ p.buyer_limit }} active requests per buyer</li>
+          <li>Marketplace, pooling, checkout and order history</li><li>Packaging quote access for farmers</li>
+        {% elif p.role == 'farmer' %}
+          <li>{{ p.farmer_limit or 'Unlimited' }} active listings</li><li>Inventory and accepted-offer analytics</li><li>Saved demand view and CSV reports</li>
+        {% else %}
+          <li>{{ p.buyer_limit or 'Unlimited' }} active sourcing requests</li><li>Multi-grower procurement analytics and CSV</li><li>Saved supply comparisons and a repeat request template</li>
+        {% endif %}
+        <li>{{ p.guide_daily }} Harvest Guide requests per day</li>
+      </ul>
+      {% if current_user.is_authenticated and current_user.role != 'admin' and (not p.role or p.role==current_user.role) %}
+        <a class="action-main" href="{{ url_for('subscription') }}">{{ _('Manage subscription') }}</a>
+      {% elif not current_user.is_authenticated and p.code=='free' %}
+        <a class="action-main" href="{{ url_for('register') }}">{{ _('Create account') }}</a>
+      {% endif %}
+    </article>
+  {% endfor %}
+  </div>
+</section>
+{% endblock %}

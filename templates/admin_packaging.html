@@ -6,7 +6,7 @@
 <div class="pilot-grid">
 {% for q in quotes %}
   <article class="workspace-card" id="quote-{{ q.id }}">
-    <span class="state-pill">{{ q.status }}</span><h2>#{{ q.id }} ? {{ q.crop }}</h2>
+    <span class="state-pill">{{ _(q.status) }}</span><h2>#{{ q.id }} ? {{ q.crop }}</h2>
     <p>{{ q.farmer_name }} ? <a href="{{ url_for('produce_detail', listing_id=q.listing_id) }}">Listing #{{ q.listing_id }}</a></p>
     <p>{{ services[q.service] }} ? {{ q.quantity_kg }} kg ? {{ q.labelled_units }} labelled units{% if q.new_design %} ? New design{% endif %}</p>
     <p class="pilot-notes">{{ q.requirements }}</p>

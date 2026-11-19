@@ -29,6 +29,7 @@ def main():
     today = date.today()
     expires = today + timedelta(days=14)
     with closing(get_db()) as db, db:
+        db.execute("INSERT INTO subscription_demo(id) VALUES (1)")
         for index, name, village in ((1, "Demo Tshisaulu Grower", "Tshisaulu"),
                                      (2, "Demo Makwarela Grower", "Makwarela")):
             farmer = db.execute("""INSERT INTO farmers(name,phone,village,demo_account)

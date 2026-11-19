@@ -1,0 +1,51 @@
+{% extends 'base.html' %}
+{% block title %}Pro tools · Harvest Pool{% endblock %}
+{% block content %}
+<section class="pilot-section plan-section">
+  <h1>{{ 'Inventory and demand insights' if current_user.role == 'farmer' else 'Procurement tools' }}</h1>
+  <div class="plan-buttons"><a class="action-main" href="{{ url_for('subscription_report') }}">Download report CSV</a>
+  {% if current_user.role == 'farmer' %}<a class="action-soft" href="{{ url_for('packaging') }}#service-requests">{{ _('Packaging quotes') }}</a>{% endif %}</div>
+  <form class="workspace-card modern-form pilot-space" method="post">
+    <h2>{{ 'Saved demand watch' if current_user.role == 'farmer' else 'Saved sourcing preferences' }}</h2>
+    <input name="csrf_token" type="hidden" value="{{ csrf_token() }}">
+    <label>{{ _('Crop') }}<input name="crop" maxlength="100" value="{{ prefs.crop if prefs else '' }}"></label>
+    {% if current_user.role == 'buyer' %}
+    <label>{{ _('Delivery location') }}<input name="place" maxlength="150" value="{{ prefs.place if prefs else '' }}"></label>
+    <div class="form-pair"><label>{{ _('Quantity (kg)') }}<input name="quantity" type="number" min="0" step=".01" value="{{ prefs.quantity if prefs else '' }}"></label>
+     <label>{{ _('Target price (R/kg)') }}<input name="target_price" type="number" min="0" step=".01" value="{{ prefs.target_price if prefs else '' }}"></label></div>
+    {% endif %}
+    <label class="checkline"><input type="checkbox" name="notify" value="yes" {% if prefs and prefs.notify %}checked{% endif %}> Highlight matching records here</label>
+    <button class="action-main">Save preferences</button>
+  </form>
+  {% if prefs and current_user.role == 'buyer' and prefs.crop and prefs.place and prefs.quantity|float > 0 and prefs.target_price|float > 0 %}
+  <form class="workspace-card modern-form pilot-space" method="post" action="{{ url_for('add_demand') }}">
+    <h2>Repeat sourcing request</h2>
+    <p>{{ prefs.crop }} · {{ prefs.quantity }} kg · {{ prefs.target_price }} ZAR/kg · {{ prefs.place }}</p>
+    <input name="csrf_token" type="hidden" value="{{ csrf_token() }}">
+    {% for key, value in {'crop':prefs.crop,'quantity_kg':prefs.quantity,'target_price':prefs.target_price,'delivery_location':prefs.place}.items() %}
+    <input name="{{ key }}" type="hidden" value="{{ value }}">
+    {% endfor %}
+    <label>{{ _('Deadline') }}<input name="deadline" required type="date"></label><button class="action-main">{{ _('New sourcing request') }}</button>
+  </form>
+  {% endif %}
+  {% if prefs and prefs.crop %}
+  <section class="workspace-card pilot-space">
+    <h2>{{ 'Matching demand' if current_user.role=='farmer' else 'Compare available supply' }}</h2>
+    {% if prefs.notify %}<p class="notice">{{ insights|length }} matching records shown for {{ prefs.crop }}.</p>{% endif %}
+    <div class="pilot-table"><table><thead><tr><th>{{ _('Crop') }}</th><th>{{ _('Quantity (kg)') }}</th><th>ZAR/kg</th><th>{{ _('Deadline') if current_user.role=='farmer' else _('Village') }}</th></tr></thead>
+    <tbody>{% for item in insights %}<tr>{% for value in item %}<td>{{ value }}</td>{% endfor %}</tr>{% else %}<tr><td colspan="4">No matching records.</td></tr>{% endfor %}</tbody></table></div>
+  </section>
+  {% endif %}
+  {% if current_user.role == 'farmer' %}
+  <section class="workspace-card pilot-space"><h2>Packaging quote overview</h2>
+    <ul>{% for item in quote_overview %}<li>{{ _(item.status) }}: {{ item.total }}</li>{% else %}<li>No quotes yet.</li>{% endfor %}</ul>
+    <a href="{{ url_for('packaging') }}#service-requests">{{ _('Your requests') }}</a>
+  </section>
+  {% endif %}
+  <section class="workspace-card pilot-space"><h2>{{ 'Listing performance' if current_user.role=='farmer' else 'Order performance' }}</h2>
+    {% set columns = ['Listing ID','Crop','Listed kg','Available kg','Accepted offers','Accepted kg'] if current_user.role=='farmer' else ['Order ID','Crop','Total kg','Produce value','Growers','Status'] %}
+    <div class="pilot-table"><table><thead><tr>{% for title in columns %}<th>{{ _(title) }}</th>{% endfor %}</tr></thead>
+    <tbody>{% for row in rows %}<tr>{% for value in row %}<td>{{ zar_cents(value) if current_user.role=='buyer' and loop.index0==3 else value }}</td>{% endfor %}</tr>{% else %}<tr><td colspan="6">No records yet.</td></tr>{% endfor %}</tbody></table></div>
+  </section>
+</section>
+{% endblock %}

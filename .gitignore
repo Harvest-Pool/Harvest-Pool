@@ -1,16 +1,21 @@
 
 # Environment variables and secrets
 .env
+.env.*
+!.env.example
 
 # Python virtual environment
 .venv/
+venv/
 
 # Python temporary files
 __pycache__/
 *.pyc
 
 # Local database
-harvest_pool.db
+*.db
+*.sqlite
+*.sqlite3
 
 # Backup files
 backups/
@@ -19,3 +24,10 @@ backups/
 instance/
 *.db-wal
 *.db-shm
+
+# Private verification evidence and local credentials
+*.sealed
+*.pem
+*.pfx
+*.key
+kyc_vault/

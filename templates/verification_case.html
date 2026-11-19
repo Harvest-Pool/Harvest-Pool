@@ -1,0 +1,47 @@
+{% extends 'base.html' %}
+{% block title %}{{ _('Evidence review') }} · Harvest Pool{% endblock %}
+{% block content %}
+<h1>{{ _(dimension) }} · #{{ case.id }}</h1>
+<p>{{ case.current_name }}{% if case.crop %} · {{ case.crop }}{% endif %} · {{ _(case.status) }}</p>
+{% if case.account_name != case.current_name or case.account_village != case.current_village %}<p class="notice error">The account details changed after submission. Request new evidence.</p>{% endif %}
+<div class="pilot-grid">
+<section class="workspace-card">
+<h2>{{ _('Submitted evidence') }}</h2>
+{% if details is not none %}
+<dl class="pilot-breakdown">{% for key,value in details.items() %}{% if value %}<div><dt>{{ _(key|replace('_',' ')|capitalize) }}</dt><dd>{{ value }}</dd></div>{% endif %}{% endfor %}</dl>
+{% for index in range(case.image_count) %}<a href="{{ url_for('kyc_image',case_id=case.id,image_index=index) }}" rel="noreferrer">{{ _('View evidence image') }} {{ index+1 }}</a><br>{% endfor %}
+{% else %}<p>{{ _('Evidence is unavailable.') }}</p>{% endif %}
+{% if case.expires_on %}<p>{{ _('Valid through') }} {{ case.expires_on }}</p>{% endif %}
+</section>
+{% if case.is_current %}
+<form class="workspace-card modern-form" method="post">
+<h2>{{ _('Record decision') }}</h2>
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="revision" value="{{ revision }}">
+<label>{{ _('Decision') }}<select name="decision">
+{% for option in decisions if (case.status=='Pending' and (details is not none or option!='Approved')) or (case.status!='Pending' and option in ('More Evidence Required','Suspended')) %}<option value="{{ option }}">{{ _(option) }}</option>{% endfor %}
+</select></label>
+<label>{{ _('Approval expiry') }}<input name="expires_on" type="date" min="{{ today }}"></label>
+{% if case.dimension=='identity' %}
+<label class="checkline"><input name="primary_check" type="checkbox" value="yes"> I matched the account name to the identity evidence.</label>
+<label class="checkline"><input name="independent_check" type="checkbox" value="yes"> I independently checked the document or the original during an assisted review.</label>
+{% elif case.dimension=='supply' %}
+<label class="checkline"><input name="primary_check" type="checkbox" value="yes"> I checked the seller’s legitimate relationship to the land or produce.</label>
+<label class="checkline"><input name="independent_check" type="checkbox" value="yes"> I corroborated the production location, recent crop evidence and declared supply with an independent source or field check.</label>
+{% else %}
+<label class="checkline"><input name="stock_check" type="checkbox" value="yes"> I independently checked this lot’s quantity through weighing, inspection or a corroborated inventory record.</label>
+{% if classes %}
+<label>Independently supported potato class<select name="grade"><option value="">No independent grade</option>{% for grade in classes %}<option value="{{ grade }}">{{ grade }}</option>{% endfor %}</select></label>
+<label class="checkline"><input name="grade_check" type="checkbox" value="yes"> I checked the issuing organisation, reference, expiry and that this certificate applies to this lot.</label>
+{% endif %}
+{% endif %}
+<label>{{ _('Reason for decision') }}<textarea name="reason" required minlength="12" maxlength="500" rows="4"></textarea></label>
+<p>This reason is shared with the seller. Do not include identity numbers, private addresses or document details.</p>
+<button class="action-main">{{ _('Record decision') }}</button>
+</form>
+{% endif %}
+</div>
+<section class="workspace-card pilot-space"><h2>{{ _('Review history') }}</h2>
+<ul>{% for entry in history %}<li>{{ entry.occurred_at }} · {{ _(entry.action) }} · {{ entry.email or 'Seller or system' }} · {{ entry.reason }}{% if entry.case_id and entry.case_id!=case.id %} · <a href="{{ url_for('admin_kyc_case',case_id=entry.case_id) }}">#{{ entry.case_id }}</a>{% endif %}</li>{% endfor %}</ul>
+</section>
+{% endblock %}

@@ -41,3 +41,21 @@
   .site-header .site-nav:not([hidden]){width:100%;display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-start;gap:.6rem 1rem;padding:.5rem 0 .8rem}
 }
 @media (prefers-reduced-motion:reduce){.mp-card,.pilot-comparison figure,.pilot-process li{transition:none;animation:none}}
+
+.language-selector{display:flex;flex-wrap:wrap;align-items:end;gap:.35rem;max-width:100%;margin:0}
+.language-selector label{display:grid;gap:.2rem;font-size:.8rem;min-width:0}
+.language-selector select{max-width:min(100%,14rem);color:#234631;background:#fff;border:1px solid #adc0ad;border-radius:.5rem;padding:.42rem}
+.language-selector button{white-space:normal}
+.app-sidebar .language-selector{margin:.6rem .45rem}
+.site-nav{flex-wrap:wrap}
+.site-nav a,.plan-card,.plan-summary{overflow-wrap:anywhere}
+.locale-note{font-size:.8rem;margin:.6rem 0;color:#3d634c}
+.plan-section{margin-block:2rem}.plan-card ul{padding-left:1.1rem;line-height:1.6}
+.plan-price{font-size:2rem;font-weight:800;color:#234631}.plan-price small{font-size:.85rem;font-weight:600}
+.plan-summary,.plan-buttons{display:flex;align-items:center;gap:.75rem 1rem;flex-wrap:wrap}
+.plan-summary{margin-bottom:1rem}.plan-summary .action-soft{margin-left:auto}
+
+.verification-history{border-top:1px solid #dce7dd;padding:.75rem 0;overflow-wrap:anywhere}
+.verification-badges{display:flex;gap:.25rem .4rem;flex-wrap:wrap;margin:.35rem 0}
+.verification-badges:empty{display:none}
+.verification-badges .state-pill{white-space:normal}

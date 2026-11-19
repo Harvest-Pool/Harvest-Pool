@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block title %}{{ _('Profile') }} · Harvest Pool{% endblock %}
+{% block content %}
+<section class="pilot-section plan-section">
+  <h1>{{ _('Profile') }}</h1>
+  <form class="workspace-card modern-form" method="post">
+    <input name="csrf_token" type="hidden" value="{{ csrf_token() }}">
+    <label>{{ _('Email address') }}<input type="email" value="{{ current_user.email }}" readonly></label>
+    <label>{{ _('Full name') }}<input name="name" maxlength="100" required value="{{ profile.name }}"></label>
+    <label>{{ _('Village / location') }}<input name="place" maxlength="150" required value="{{ profile.place }}"></label>
+    <button class="action-main">{{ _('Save profile') }}</button>
+  </form>
+</section>
+{% endblock %}

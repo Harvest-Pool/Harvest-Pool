@@ -28,6 +28,10 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import click
 
 from services import migrate_services, register_services
+from seller_verification import POTATO_CLASSES, migrate_verification, register_verification
+from localization import locale, migrate_locales, register_localization, translate
+from subscriptions import (ACTIVE_SQL, consume_guide_request, migrate_subscriptions,
+                           plan_for, register_subscriptions, resource_limit_reached)
 
 # Legacy credential names may still be present in the exposed local file.
 # Read only the explicitly rotated names and non-secret settings.
@@ -48,6 +52,7 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE', 'false').lower() == 'true',
     MAX_CONTENT_LENGTH=6 * 1024 * 1024,
     DEMO_MODE=os.getenv("HARVEST_DEMO_MODE") == "1",
+    SUBSCRIPTION_DEMO=os.getenv("HARVEST_SUBSCRIPTION_DEMO") == "1",
 )
 csrf = CSRFProtect(app)
 login_manager = LoginManager(app)
@@ -71,6 +76,15 @@ HERITAGE_CROPS = (
 HERITAGE_NAMES = {item['name'].casefold() for item in HERITAGE_CROPS}
 DATABASE = os.getenv('HARVEST_DATABASE', str(Path(__file__).with_name('harvest_pool.db')))
 UPLOAD_DIR = Path(os.getenv('HARVEST_UPLOAD_DIR', str(Path(app.instance_path) / 'produce_photos')))
+app.config.update(
+    KYC_PRIVATE_DIR=os.environ.get("HARVEST_KYC_PRIVATE_DIR"),
+    KYC_ENCRYPTION_KEY=os.environ.get("HARVEST_KYC_ENCRYPTION_KEY"),
+    KYC_REVIEWERS={email.strip().casefold() for email in os.environ.get("HARVEST_KYC_REVIEWERS", "").split(",") if email.strip()},
+    KYC_PRIVACY_CONTACT=os.environ.get("HARVEST_KYC_PRIVACY_CONTACT"),
+    KYC_CONTROLLER=os.environ.get("HARVEST_KYC_CONTROLLER"),
+    KYC_BASIS=os.environ.get("HARVEST_KYC_BASIS"),
+    KYC_PUBLIC_MEDIA=str(UPLOAD_DIR),
+)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 Image.MAX_IMAGE_PIXELS = 20_000_000
 
@@ -278,6 +292,9 @@ def init_db():
                    FROM order_farmer_allocations a2 WHERE a2.order_id=o.id)=o.indicative_total_cents
         """)
         migrate_services(db)
+        migrate_subscriptions(db)
+        migrate_locales(db)
+        migrate_verification(db)
         db.commit()
     finally:
         db.close()
@@ -290,6 +307,7 @@ class User(UserMixin):
         self.role = row['role']
         self.profile_id = row['profile_id']
         self.active = bool(row['is_active'])
+        self.preferred_locale = row['preferred_locale']
 
     @property
     def is_active(self):
@@ -303,6 +321,7 @@ class AdminUser(UserMixin):
         self.db_id = row['id']
         self.email = row['email']
         self.active = bool(row['is_active'])
+        self.preferred_locale = row['preferred_locale']
 
     def get_id(self):
         return f'admin:{self.db_id}'
@@ -473,10 +492,14 @@ def expiry_warning_date(today_string):
 
 def active_supply_query():
     return '''SELECT p.id,p.crop,p.available_kg,p.asking_price,p.quality,p.harvest_date,
-        p.available_until,p.photo_filename,f.village,f.name AS farmer_name
+        p.available_until,p.photo_filename,f.village,f.name AS farmer_name,se.verified AS seller_verified,
+        COALESCE(b.stock_verified,0) AS stock_verified,b.grade_verified,
+        EXISTS(SELECT 1 FROM kyc_valid k WHERE k.farmer_id=f.id AND k.dimension='supply') AS supply_reviewed
         FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id
+        JOIN seller_eligibility se ON se.farmer_id=f.id
+        LEFT JOIN kyc_valid b ON b.listing_id=p.id AND b.dimension='batch'
         WHERE p.available_kg>0 AND p.asking_price IS NOT NULL
-          AND f.verification_status='Approved'
+          AND se.eligible=1
           AND p.available_until >= ?
         '''
 
@@ -544,7 +567,7 @@ def can_manage_listing(row):
 
 
 def listing_is_public(row):
-    return (row['verification_status'] == 'Approved' and row['available_kg'] > 0
+    return (row['eligible'] and row['available_kg'] > 0
             and row['asking_price'] is not None
             and (row['available_until'] or '') >= date.today().isoformat())
 
@@ -553,8 +576,12 @@ def listing_is_public(row):
 def produce_detail(listing_id):
     db=get_db()
     try:
-        listing=db.execute('''SELECT p.*,f.name AS farmer_name,f.village,f.verification_status
+        listing=db.execute('''SELECT p.*,f.name AS farmer_name,f.village,f.verification_status,se.eligible,
+                              se.verified AS seller_verified,COALESCE(b.stock_verified,0) AS stock_verified,b.grade_verified,
+                              EXISTS(SELECT 1 FROM kyc_valid k WHERE k.farmer_id=f.id AND k.dimension='supply') AS supply_reviewed
                               FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id
+                              JOIN seller_eligibility se ON se.farmer_id=f.id
+                              LEFT JOIN kyc_valid b ON b.listing_id=p.id AND b.dimension='batch'
                               WHERE p.id=?''',(listing_id,)).fetchone()
     finally:
         db.close()
@@ -571,8 +598,8 @@ def produce_detail(listing_id):
 def produce_photo(listing_id):
     db=get_db()
     try:
-        row=db.execute('''SELECT p.*,f.verification_status
-            FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id WHERE p.id=?''',
+        row=db.execute('''SELECT p.*,se.eligible
+            FROM produce_listings p JOIN seller_eligibility se ON se.farmer_id=p.farmer_id WHERE p.id=?''',
             (listing_id,)).fetchone()
     finally:
         db.close()
@@ -647,15 +674,21 @@ def upload_produce_photo(listing_id):
 @require_role('farmer')
 def update_availability(listing_id):
     expiry=request.form.get('available_until','').strip()
+    today = date.today().isoformat()
     db=get_db()
     try:
-        row=db.execute('SELECT harvest_date FROM produce_listings WHERE id=? AND farmer_id=?',
+        db.execute('BEGIN IMMEDIATE')
+        row=db.execute('SELECT harvest_date,available_until,available_kg FROM produce_listings WHERE id=? AND farmer_id=?',
                        (listing_id,current_user.profile_id)).fetchone()
         if not row:
             abort(404)
-        if not parse_date(expiry) or expiry<row['harvest_date'] or expiry < date.today().isoformat():
+        if not parse_date(expiry) or expiry<row['harvest_date'] or expiry < today:
             flash('Choose an availability deadline on or after the harvest-ready date.','error')
             return redirect(url_for('dashboard'))
+        if (row['available_kg'] > 0 and (row['available_until'] or '') < today
+                and resource_limit_reached(db, current_user, app.config, today)):
+            flash('Your plan limit has been reached.', 'error')
+            return redirect(url_for('subscription'))
         with db:
             db.execute('UPDATE produce_listings SET available_until=? WHERE id=? AND farmer_id=?',
                        (expiry,listing_id,current_user.profile_id))
@@ -672,8 +705,13 @@ def dashboard():
         return redirect(url_for('admin_dashboard'))
     db = get_db()
     try:
+        account_plan = plan_for(db, current_user, app.config)
+        active_count = db.execute(ACTIVE_SQL[current_user.role],
+                                  (current_user.profile_id, date.today().isoformat())).fetchone()[0]
         if current_user.role == 'farmer':
-            farmer_profile = db.execute('SELECT verification_status FROM farmers WHERE id=?',
+            farmer_profile = db.execute('''SELECT CASE WHEN f.verification_status='Approved' AND se.eligible=0
+                THEN 'Expired' ELSE f.verification_status END AS verification_status
+                FROM farmers f JOIN seller_eligibility se ON se.farmer_id=f.id WHERE f.id=?''',
                                        (current_user.profile_id,)).fetchone()
             my_listings = db.execute('''SELECT * FROM produce_listings WHERE farmer_id = ?
                                         ORDER BY id DESC''', (current_user.profile_id,)).fetchall()
@@ -697,7 +735,7 @@ def dashboard():
                 JOIN paystack_test_payments p ON p.id=t.payment_id
                 WHERE t.farmer_id=? ORDER BY t.id DESC LIMIT 30''',
                 (current_user.profile_id,)).fetchall()
-            return render_template('index.html', settlement_rows=settlement_rows,
+            return render_template('index.html', account_plan=account_plan, active_count=active_count, settlement_rows=settlement_rows,
                                    my_listings=my_listings, today=date.today().isoformat(),
                                    my_contributions=my_contributions, seller_verification=farmer_profile['verification_status'],
                                    my_demands=[], market_listings=[], my_pools=[], demo_orders=[],
@@ -738,7 +776,7 @@ def dashboard():
             JOIN demo_orders o ON o.id=p.order_id
             WHERE o.buyer_id=? AND p.status='verified_test'
             ORDER BY p.id DESC LIMIT 50''', (current_user.profile_id,)).fetchall()
-        return render_template('index.html', verified_orders=verified_orders,
+        return render_template('index.html', account_plan=account_plan, active_count=active_count, verified_orders=verified_orders,
                                my_listings=[], my_contributions=[],
                                my_demands=my_demands, market_listings=market_listings, today=date.today().isoformat(),
                                my_pools=my_pools, summary=summary, demo_orders=demo_orders,
@@ -751,6 +789,7 @@ def dashboard():
 
 @app.post('/produce/add')
 @require_role('farmer')
+@limiter.limit('25 per hour')
 def add_produce():
     crop = request.form.get('crop', '').strip().title()
     qty = positive_number(request.form.get('quantity_kg'))
@@ -761,21 +800,33 @@ def add_produce():
     if not asking or asking > 1_000_000:
         flash('Enter a valid asking price per kg.', 'error')
         return redirect(url_for('dashboard'))
-    if not crop or len(crop) > 100 or not qty or not parse_date(harvested) or not parse_date(expiry) or expiry < harvested or expiry < date.today().isoformat() or quality not in ('Grade A', 'Grade B', 'Mixed'):
+    quality_options = ('Grade A', 'Grade B', 'Mixed')
+    if crop.casefold() in {'potato', 'potatoes'}:
+        quality_options += POTATO_CLASSES
+    if not crop or len(crop) > 100 or not qty or not parse_date(harvested) or not parse_date(expiry) or expiry < harvested or expiry < date.today().isoformat() or quality not in quality_options:
         flash('Complete valid produce details.', 'error')
         return redirect(url_for('dashboard'))
-    try:
-        filename=save_produce_photo(request.files.get('photo'))
-    except ValueError as e:
-        flash(str(e),'error')
-        return redirect(url_for('dashboard'))
     db = get_db()
+    filename = None
     try:
         with db:
-            db.execute('''INSERT INTO produce_listings
+            db.execute('BEGIN IMMEDIATE')
+            if resource_limit_reached(db, current_user, app.config, date.today().isoformat()):
+                flash('Your plan limit has been reached.', 'error')
+                return redirect(url_for('subscription'))
+            try:
+                filename = save_produce_photo(request.files.get('photo'))
+            except ValueError as error:
+                flash(str(error), 'error')
+                return redirect(url_for('dashboard'))
+            db.execute("""INSERT INTO produce_listings
                 (farmer_id, crop, quantity_kg, available_kg, harvest_date, quality, asking_price, available_until, photo_filename)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (current_user.profile_id, crop, qty, qty, harvested, quality, asking, expiry, filename))
+    except Exception:
+        if filename:
+            (UPLOAD_DIR / filename).unlink(missing_ok=True)
+        raise
     finally:
         db.close()
     flash('Your produce was listed.', 'success')
@@ -818,19 +869,25 @@ def set_asking_price(listing_id):
 
 @app.post('/demands/add')
 @require_role('buyer')
+@limiter.limit('25 per hour')
 def add_demand():
     crop = request.form.get('crop', '').strip().title()
     qty = positive_number(request.form.get('quantity_kg'))
     price = positive_number(request.form.get('target_price'))
     deadline = request.form.get('deadline', '')
     location = request.form.get('delivery_location', '').strip()
+    today = date.today().isoformat()
     if (not crop or len(crop) > 100 or not qty or not price or not parse_date(deadline)
-            or not location or len(location) > 150):
+            or deadline < today or not location or len(location) > 150):
         flash('Complete valid buyer demand details.', 'error')
         return redirect(url_for('dashboard'))
     db = get_db()
     try:
         with db:
+            db.execute('BEGIN IMMEDIATE')
+            if resource_limit_reached(db, current_user, app.config, today):
+                flash('Your plan limit has been reached.', 'error')
+                return redirect(url_for('subscription'))
             db.execute('''INSERT INTO buyer_demands
                 (buyer_id, crop, quantity_kg, target_price, deadline, delivery_location)
                 VALUES (?, ?, ?, ?, ?, ?)''',
@@ -909,7 +966,8 @@ def match_supply(demand_id):
                 COALESCE((SELECT SUM(pc.quantity_kg) FROM pool_contributions pc
                           WHERE pc.listing_id=p.id AND pc.offer_status='Pending'),0) AS pending_kg
                 FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id
-                WHERE f.verification_status='Approved' AND LOWER(p.crop)=LOWER(?) AND p.available_kg > 0 AND p.harvest_date <= ?
+                JOIN seller_eligibility se ON se.farmer_id=f.id
+                WHERE se.eligible=1 AND LOWER(p.crop)=LOWER(?) AND p.available_kg > 0 AND p.harvest_date <= ?
                   AND p.asking_price IS NOT NULL AND p.asking_price <= ?
                   AND p.available_until >= ?
                 ORDER BY p.asking_price ASC, p.harvest_date ASC, p.id ASC''',
@@ -952,10 +1010,10 @@ def respond_to_offer(contribution_id, decision):
     db = get_db()
     try:
         db.execute('BEGIN IMMEDIATE')
-        offer = db.execute('''SELECT pc.*, p.available_kg, p.available_until, f.verification_status
+        offer = db.execute('''SELECT pc.*, p.available_kg, p.available_until,se.eligible
             FROM pool_contributions pc
             JOIN produce_listings p ON p.id=pc.listing_id
-            JOIN farmers f ON f.id=p.farmer_id
+            JOIN seller_eligibility se ON se.farmer_id=p.farmer_id
             WHERE pc.id=? AND pc.farmer_id=? AND p.farmer_id=?''',
             (contribution_id, current_user.profile_id, current_user.profile_id)).fetchone()
         if not offer:
@@ -972,7 +1030,7 @@ def respond_to_offer(contribution_id, decision):
             flash('This offer has already been handled or belongs to an older test pool.', 'error')
             return redirect(url_for('dashboard'))
         if decision == 'accept':
-            if offer['verification_status'] != 'Approved':
+            if not offer['eligible']:
                 db.rollback()
                 flash('Seller review approval is required before accepting a new offer.', 'error')
                 return redirect(url_for('dashboard'))
@@ -1595,9 +1653,9 @@ def admin_dashboard():
     try:
         farmers = db.execute('''SELECT f.id,f.name,f.phone,f.village,f.verification_status,
           f.verified_at,f.demo_account,COUNT(p.id) AS listing_count,
-          SUM(CASE WHEN f.verification_status='Approved' AND p.available_kg > 0
+          SUM(CASE WHEN se.eligible=1 AND p.available_kg > 0
                    AND p.asking_price IS NOT NULL AND p.available_until >= ? THEN 1 ELSE 0 END) AS public_count
-          FROM farmers f LEFT JOIN produce_listings p ON p.farmer_id=f.id
+          FROM farmers f JOIN seller_eligibility se ON se.farmer_id=f.id LEFT JOIN produce_listings p ON p.farmer_id=f.id
           GROUP BY f.id ORDER BY CASE f.verification_status
               WHEN 'Pending' THEN 0 WHEN 'Suspended' THEN 1 ELSE 2 END,f.id DESC''',
           (date.today().isoformat(),)).fetchall()
@@ -1700,16 +1758,16 @@ def discover_produce():
 
 
 GUIDE_TOPICS = (
-    (('packag', 'brand', 'u paka', 'lebula'), 'packaging',
+    (('packag', 'brand', 'u paka', 'lebula', 'ukupakisha', 'amalebula'), 'packaging',
      'Farmers can open Packaging & Branding, choose their own listing and request a quote. Enter kilograms and the number of individual units to label.',
      'Vhalimi vha nga humbela khotheisheni kha Packaging & Branding. Nangani zwibveledzwa zwaṋu, ni ṅwale khilogireme na tshivhalo tsha zwiputelwa zwine zwa ṱoḓa lebula.'),
-    (('pool', 'bulk', 'tangany', 'tanganel'), 'marketplace',
+    (('pool', 'bulk', 'tangany', 'tanganel', 'hlanganisa'), 'marketplace',
      'A buyer requests a quantity and price. Several farmers can supply the order after each accepts their own offer. The buyer can create the order when the agreed quantity is covered.',
      'Murengi u amba uri u ṱoḓa khilogireme nngana na mutengo. Vhalimi vho fhambanaho vha nga ṱanganya zwibveledzwa zwavho musi muṅwe na muṅwe o tenda.'),
-    (('register', 'account', 'sign up', 'sell', 'dinwal', 'vengesa'), 'register',
+    (('register', 'account', 'sign up', 'sell', 'dinwal', 'vengesa', 'bhalis', 'thengisa'), 'register',
      'Create a farmer account and add a listing with a price, stock and a selling date. An administrator must approve your seller account before the listing is public.',
      'Ḓiṅwaliseni sa mulimi. Engedzani zwibveledzwa, mutengo, tshivhalo na datumu. Mulanguli u fanela u tendela akhaunthu yaṋu uri vharengi vha vhone zwibveledzwa.'),
-    (('pay', 'checkout', 'mbadelo', 'badel'), 'marketplace',
+    (('pay', 'checkout', 'mbadelo', 'badel', 'khokha', 'nkonto yokuhlola'), 'marketplace',
      'Buyers can use Paystack test checkout for eligible pooled orders. The dashboard shows test verification and farmer allocations.',
      'Vharengi vha nga linga mbadelo nga Paystack kha odara yo ṱanganelwaho. Kha dashboard vha nga vhona mvelelo dza ndingo.'),
 )
@@ -1719,13 +1777,22 @@ GUIDE_GENERAL = (
 )
 
 
+GUIDE_ZULU = {
+    'packag': 'Abalimi bangavula ikhasi lokupakisha namalebula, bakhethe isivuno sabo bese becela isilinganiso sezindleko. Faka amakhilogremu nenani lamayunithi azofakwa amalebula.',
+    'pool': 'Umthengi ucela inani lezivuno nentengo. Abalimi abaningana bangahlanganisa izivuno zabo uma ngamunye esamukele isiphakamiso sakhe. Umthengi angadala i-oda uma inani eliceliwe selitholakele.',
+    'register': 'Dala i-akhawunti yomlimi bese ufaka isivuno, intengo, inani nosuku lokugcina lokuthengisa. Umlawuli kufanele avume i-akhawunti yakho ngaphambi kokuba abathengi babone isivuno.',
+    'pay': 'Abathengi bangasebenzisa ukukhokha kokuhlola kwe-Paystack kuma-oda afanelekile. Ideshibhodi ikhombisa ukuqinisekiswa kwenkokhelo yokuhlola nokwabiwa kwe-oda.',
+    'general': 'Vula imakethe ukuze ubone izivuno ezivunyelwe. Ungabuza ngokuhlanganisa izivuno, ukuthengisa, izinkokhelo zokuhlola noma ukupakisha.',
+}
+
+
 def guide_topic(question):
     query = ''.join(char for char in unicodedata.normalize('NFD', question.casefold())
                     if not unicodedata.combining(char))
     for keywords, page, english, tshivenda in GUIDE_TOPICS:
         if any(keyword in query for keyword in keywords):
-            return url_for(page), (english, tshivenda)
-    return url_for('marketplace'), GUIDE_GENERAL
+            return url_for(page), (english, tshivenda, GUIDE_ZULU[keywords[0]])
+    return url_for('marketplace'), (*GUIDE_GENERAL, GUIDE_ZULU['general'])
 
 
 @app.post('/api/assistant/ask')
@@ -1735,16 +1802,25 @@ def ask_assistant():
     if not isinstance(payload, dict):
         return jsonify({'error': 'Invalid request'}), 400
     question = payload.get('message')
-    language = payload.get('language', 'en-ZA')
+    language = payload.get('language', locale())
     if (not isinstance(question, str) or not 0 < len(question.strip()) <= 350
             or not isinstance(language, str) or language not in SPOKEN_LANGUAGES):
-        return jsonify({'error': 'Select a language and enter a question of 1?350 characters.'}), 400
+        return jsonify({'error': 'Select a language and enter a question of 1 to 350 characters.'}), 400
+    if current_user.is_authenticated and current_user.role in ACTIVE_SQL:
+        db = get_db()
+        try:
+            with db:
+                if not consume_guide_request(db, current_user, app.config):
+                    return jsonify(error=translate('Your plan limit has been reached.')), 429
+        finally:
+            db.close()
     question = question.strip()
     suggested_url, guide = guide_topic(question)
     key = os.getenv('HARVEST_ROTATED_OPENAI_KEY', '').strip()
     if not key:
-        if language in ('en-ZA', 've-ZA'):
-            return jsonify(answer=guide[int(language == 've-ZA')], suggested_url=suggested_url,
+        offline = {'en-ZA': 0, 've-ZA': 1, 'zu-ZA': 2}
+        if language in offline:
+            return jsonify(answer=guide[offline[language]], suggested_url=suggested_url,
                            ai_active=False, notice='AI is unconfigured. Showing the built-in platform guide.')
         return jsonify(error='This language requires AI text. Set a fresh HARVEST_ROTATED_OPENAI_KEY on the server and restart Harvest Pool.'), 503
     # No private account or contact information is exposed to the AI.
@@ -1798,6 +1874,9 @@ def ask_assistant():
         return jsonify(error='AI connection unavailable. Check configuration or try again shortly.'), 503
 
 register_services(app, get_db, require_role, limiter)
+register_subscriptions(app, get_db, require_role, limiter)
+register_localization(app, get_db)
+register_verification(app, get_db, require_role, limiter)
 init_db()
 
 if __name__ == '__main__':

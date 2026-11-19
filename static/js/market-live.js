@@ -6,6 +6,7 @@
   const count = document.getElementById('mp-count');
   let timer;
   let pending;
+  let failed = false;
 
   function filterUrl() {
     const url = new URL(form.action);
@@ -34,8 +35,8 @@
       if (controller.signal.aborted) return;
       results.replaceChildren(...next.childNodes);
       count.textContent = nextCount.textContent;
-      feedback.textContent = count.textContent === '1' ? '1 listing on this page' :
-        count.textContent + ' listings on this page';
+      failed = false;
+      feedback.textContent = section.dataset.resultsLabel + ': ' + count.textContent;
       if (historyMode !== 'replaceState') {
         for (const field of nextForm.elements) {
           if (field.name && form.elements.namedItem(field.name)) {
@@ -45,7 +46,10 @@
       }
       if (url.href !== window.location.href) history[historyMode](null, '', url);
     } catch (error) {
-      if (!controller.signal.aborted) feedback.textContent = 'Could not update listings. Use Apply filters to retry.';
+      if (!controller.signal.aborted) {
+        failed = true;
+        feedback.textContent = section.dataset.filterError;
+      }
     } finally {
       if (pending === controller) {
         pending = undefined;
@@ -55,7 +59,7 @@
   }
 
   form.addEventListener('submit', event => {
-    if (feedback.textContent.startsWith('Could not')) return;
+    if (failed) return;
     event.preventDefault();
     update(filterUrl(), 'pushState');
   });
