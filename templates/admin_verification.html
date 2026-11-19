@@ -1,0 +1,19 @@
+{% extends 'base.html' %}
+{% block title %}{{ _('Evidence review') }} · Harvest Pool{% endblock %}
+{% block content %}
+<h1>{{ _('Evidence review') }}</h1>
+<p>Review the person, their supply arrangements and the specific lot separately. Keep full ID numbers and private addresses out of review notes.</p>
+<div class="workspace-card pilot-table"><table>
+<thead><tr><th>{{ _('Name') }}</th><th>{{ _('Evidence type') }}</th><th>{{ _('Status') }}</th><th>{{ _('Review') }}</th></tr></thead>
+<tbody>{% for case in cases %}<tr><td>{{ case.name }}</td><td>{{ _(dimensions[case.dimension]) }}{% if case.crop %} · {{ case.crop }}{% endif %}</td><td>{{ _('Expired') if case.expires_on and case.expires_on < today else _(case.status) }}</td>
+<td><a href="{{ url_for('admin_kyc_case',case_id=case.id) }}">{{ _('Review') }} #{{ case.id }}</a></td></tr>
+{% else %}<tr><td colspan="4">{{ _('No evidence submitted.') }}</td></tr>{% endfor %}</tbody>
+</table></div>
+<section class="workspace-card pilot-space"><h2>{{ _('Privacy requests') }}</h2>
+{% for entry in privacy %}
+<article class="verification-history"><p>#{{ entry.id }} · {{ entry.name }} · {{ _(entry.kind|capitalize) }} · {{ _(entry.status) }}</p>
+{% if entry.status == 'Open' %}<form class="modern-form" action="{{ url_for('resolve_kyc_privacy',request_id=entry.id) }}" method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label>Resolution summary without private data<input name="reason" required minlength="12" maxlength="500"></label><button class="action-soft">Record resolution</button>
+</form>{% endif %}</article>
+{% else %}<p>No privacy requests.</p>{% endfor %}</section>
+{% endblock %}

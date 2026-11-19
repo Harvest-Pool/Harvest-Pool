@@ -1,0 +1,10 @@
+{% extends 'base.html' %}
+{% block title %}{{ _('Accessibility') }} · Harvest Pool{% endblock %}
+{% block content %}
+<section class="pilot-section">
+  <h1>{{ _('Accessibility') }}</h1>
+  <h2>{{ _('South African Sign Language') }}</h2>
+  <p>Signed video instructions and live sign-language interpretation are currently unavailable. The site language selector changes written interface text.</p>
+  <p>Use the <a href="{{ url_for('home') }}#how-it-works">written marketplace walkthrough</a> or type a question into Harvest Guide. All essential interactions use text labels and can be reached with a keyboard.</p>
+</section>
+{% endblock %}

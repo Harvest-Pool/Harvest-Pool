@@ -1,0 +1,29 @@
+<section class="pilot-intro" id="packaging-services">
+  <div class="pilot-copy">
+    <p class="eyebrow">PACKAGING &amp; BRANDING</p>
+    <h2>More than a marketplace. <em>Make your harvest market-ready.</em></h2>
+    <p>Turn pooled produce into buyer-ready bags, punnets or cartons. Growers can request help with packing, custom labels and product presentation. Buyers can specify the format that suits their shelves or kitchens.</p>
+    <a class="action-main" href="{{ url_for('packaging') }}#service-requests">{{ _('Request packaging &amp; branding') }}</a>
+  </div>
+  <div class="pilot-visual">
+  <div class="pilot-controls" role="group" aria-label="Packaging comparison view" hidden>
+    <button type="button" data-preview="both" aria-pressed="true">{{ _('Compare') }}</button>
+    <button type="button" data-preview="before" aria-pressed="false">{{ _('Before') }}</button>
+    <button type="button" data-preview="after" aria-pressed="false">{{ _('After') }}</button>
+  </div>
+  <div class="pilot-comparison" aria-label="Illustrative before and after produce presentation">
+    <figure class="pilot-before">
+      <div class="pilot-crate" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      <figcaption><strong>{{ _('Before') }}</strong> Loose potatoes in a farm crate</figcaption>
+    </figure>
+    <figure class="pilot-after">
+      <img width="600" height="400" loading="lazy" decoding="async"
+           src="{{ url_for('static', filename='images/packaging-600.webp') }}"
+           srcset="{{ url_for('static', filename='images/packaging-600.webp') }} 600w, {{ url_for('static', filename='images/packaging-1200.webp') }} 1200w"
+           sizes="(max-width: 740px) 42vw, 310px" alt="Sample Vhembe Grown potato bag, berry punnet and produce carton">
+      <figcaption><strong>{{ _('After') }}</strong> Packed and labelled for buyers</figcaption>
+    </figure>
+  </div>
+  </div>
+  <ol class="pilot-process"><li>{{ _('Harvest') }}</li><li>{{ _('Aggregate') }}</li><li>{{ _('Package') }}</li><li>{{ _('Brand') }}</li><li>{{ _('Market') }}</li></ol>
+</section>

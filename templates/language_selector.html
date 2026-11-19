@@ -1,0 +1,12 @@
+<form class="language-selector" method="post" action="{{ url_for('change_language') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="return_to" value="{{ request.full_path if request.query_string else request.path }}">
+  <label><span>{{ _('Language') }}</span>
+    <select name="locale">
+      {% for code, name in ui_languages.items() %}
+      <option value="{{ code }}" lang="{{ code }}" {% if ui_locale == code %}selected{% endif %}>{{ name }}{% if code in ui_previews %} · {{ _('Preview translation') }}{% elif code != 'en-ZA' %} · {{ _('Translation unavailable') }}{% endif %}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit" class="action-soft">{{ _('Change language') }}</button>
+</form>

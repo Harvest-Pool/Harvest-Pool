@@ -1,0 +1,8 @@
+{% if item.seller_verified or item.supply_reviewed or item.stock_verified or item.grade_verified %}
+<div class="verification-badges">
+{% if item.seller_verified %}<span class="state-pill approved">{{ _('Seller verified') }}</span>{% endif %}
+{% if item.supply_reviewed %}<span class="state-pill approved">{{ _('Supply evidence reviewed') }}</span>{% endif %}
+{% if item.stock_verified %}<span class="state-pill approved">{{ _('Stock independently checked') }}</span>{% endif %}
+{% if item.grade_verified %}<span class="state-pill approved">{{ _('Grade independently verified') }} · {{ item.grade_verified }}</span>{% endif %}
+</div>
+{% endif %}

@@ -1,0 +1,16 @@
+<div class="hp-calls" id="hp-calls" hidden>
+ <div class="hp-call-panel" role="dialog" aria-modal="false" aria-label="Harvest Pool voice call">
+  <div class="hp-call-top"><span class="hp-call-brand">✳ Harvest Pool <small>Voice calls</small></span><button id="hp-call-close" type="button" aria-label="Close">×</button></div>
+  <div class="hp-call-avatar" aria-hidden="true">☎</div>
+  <strong id="hp-call-peer">Harvest Pool member</strong>
+  <p id="hp-call-status" role="status" aria-live="polite">Connecting…</p>
+  <audio id="hp-remote-audio" autoplay playsinline></audio>
+  <div class="hp-call-actions">
+   <button id="hp-accept-call" type="button" hidden>✓ Accept</button>
+   <button id="hp-decline-call" type="button" hidden>Decline</button>
+   <button id="hp-mute-call" type="button" hidden>Mute</button>
+   <button id="hp-end-call" type="button">End call</button>
+  </div>
+  <p class="hp-call-note">Call audio uses your microphone. No call recording is provided.</p>
+ </div>
+</div>

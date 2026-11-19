@@ -1,0 +1,47 @@
+{% extends 'base.html' %}
+{% block title %}Explore the marketplace · Harvest Pool{% endblock %}
+{% block content %}
+<section class="mp-hero" aria-labelledby="mp-title">
+  <div class="mp-hero-copy"><div class="mp-kicker"><span class="mp-kicker-dot"></span> THE FRESH PRODUCE MARKETPLACE</div>
+    <h1 id="mp-title">{{ _('Find better produce.') }}<br><em>{{ _('Grow stronger trade.') }}</em></h1>
+    <p>Discover real harvests from growers across the region. Compare availability, quality and pricing in one place.</p>
+    <div class="mp-hero-actions"><a href="#market-results" class="mp-primary">Explore produce <span aria-hidden="true">↗</span></a><a href="{{ url_for('register') }}" class="mp-secondary">List your harvest</a></div>
+  </div>
+  <div class="mp-hero-art" aria-hidden="true"><div class="mp-art-orb">✳</div><span class="mp-art-caption">One market.<br>More opportunities.</span><div class="mp-art-lines"></div></div>
+</section>
+<section class="mp-main" id="market-results"
+  data-loading="{{ _('Finding produce…') }}"
+  data-results-label="{{ _('Listings on this page') }}"
+  data-filter-error="{{ _('Could not update listings. Use Apply filters to retry.') }}"
+  aria-labelledby="mp-results-title">
+ <div class="mp-section-heading"><div><span class="mp-overline">HARVEST DISCOVERY</span><h2 id="mp-results-title">{{ _('Explore available produce') }}</h2><p>Find what you need, from traditional greens to everyday essentials.</p></div><div class="mp-result-bubble"><strong id="mp-count">{{ listings|length }}</strong><span>on this page</span></div></div>
+ <form class="mp-toolbar" method="get" action="{{ url_for('marketplace') }}#market-results">
+   <label>{{ _('Search') }}<input name="q" type="search" value="{{ query }}" placeholder="Crop, village or grade" maxlength="80"></label>
+   <label>{{ _('Crop') }}<select name="crop"><option value="">{{ _('All produce') }}</option>{% for item in crops %}<option {{ 'selected' if item.crop == crop else '' }}>{{ item.crop }}</option>{% endfor %}</select></label>
+   <label>{{ _('Sort by') }}<select name="sort">{% for key, item in sorts.items() %}<option value="{{ key }}" {{ 'selected' if sort == key else '' }}>{{ _(item[0]) }}</option>{% endfor %}</select></label>
+   <button class="action-main">{{ _('Apply filters') }}</button><a data-market-clear href="{{ url_for('marketplace') }}#market-results">{{ _('Clear filters') }}</a>
+ </form>
+ <p class="market-feedback" id="market-feedback" role="status"></p>
+ <div id="market-listings">
+ <div class="mp-grid" id="mp-grid">
+  {% for x in listings %}
+  <a class="mp-card" href="{{ url_for('produce_detail',listing_id=x.id) }}" data-crop="{{ x.crop|e }}" data-place="{{ x.village|e }}" data-quality="{{ x.quality|e }}" data-price="{{ x.asking_price }}" data-quantity="{{ x.available_kg }}" data-rank="{{ loop.index }}">
+   <div class="mp-photo">
+    {% if x.photo_filename %}<img loading="lazy" src="{{ url_for('produce_photo',listing_id=x.id) }}" alt="Photograph of {{ x.crop }} offered by a grower">{% else %}<div class="mp-no-photo"><span aria-hidden="true">✳</span><small>Harvest Pool produce</small></div>{% endif %}
+    <div class="mp-photo-badges">{% if heritage_check(x.crop) %}<span class="mp-heritage">{{ _('Harvest Heritage') }}</span>{% endif %}<span class="mp-quality">{{ _('Seller-declared quality') }}: {{ x.quality }}</span></div>
+   </div>
+   <div class="mp-card-body"><div class="mp-card-location"><span aria-hidden="true">⌖</span> {{ x.village }}</div><h3>{{ x.crop }}</h3>{% set item=x %}{% include 'verification_badges.html' %}<div class="mp-card-price"><strong>R{{ '%.2f'|format(x.asking_price) }}</strong><span>per kg</span></div><div class="mp-card-separator"></div><div class="mp-card-bottom"><div><span class="mp-label">{{ _('Available') }}</span><strong>{{ '%.1f'|format(x.available_kg) }} kg</strong></div><span class="mp-arrow" aria-hidden="true">↗</span></div>{% if x.harvest_date %}<div class="mp-card-date">{{ 'Upcoming harvest · ' if today is defined and x.harvest_date > today else 'Harvest date · ' }}{{ x.harvest_date }}</div>{% endif %}</div>
+  </a>
+  {% endfor %}
+ </div>
+ {% if not listings %}<div class="mp-empty"><h3>{{ _('No eligible listings match your filters') }}</h3><p>Approved listings with current stock, pricing and selling dates appear here.</p></div>{% endif %}
+ {% if page > 1 or has_next %}<nav class="pilot-pagination" aria-label="Marketplace pages">
+ {% if page > 1 %}<a href="{{ url_for('marketplace', q=query, crop=crop, sort=sort, page=page-1) }}#market-results">{{ _('Previous') }}</a>{% endif %}
+ <span>Page {{ page }}</span>
+ {% if has_next %}<a href="{{ url_for('marketplace', q=query, crop=crop, sort=sort, page=page+1) }}#market-results">{{ _('Next') }}</a>{% endif %}
+ </nav>{% endif %}
+ </div>
+</section>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/marketplace-refresh.css') }}">
+<script src="{{ url_for('static', filename='js/market-live.js') }}" defer></script>
+{% endblock %}

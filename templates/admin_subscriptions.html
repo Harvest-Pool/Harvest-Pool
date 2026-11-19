@@ -1,0 +1,30 @@
+{% extends 'base.html' %}
+{% block title %}{{ _('Subscriptions') }} · Harvest Pool{% endblock %}
+{% block content %}
+<h1>{{ _('Subscriptions') }}</h1>
+<p>Mock attempts and access periods are for the isolated demo. Verified subscription revenue is {{ zar_cents(0) }}.</p>
+<div class="pilot-grid">
+{% for p in plans %}
+<form class="workspace-card modern-form" method="post">
+  <h2>{{ _(p.name) }} · {{ counts[p.code] }} accounts</h2>
+  <input name="csrf_token" type="hidden" value="{{ csrf_token() }}">
+  <input name="code" type="hidden" value="{{ p.code }}">
+  {% if p.code == 'free' %}
+  <label>Farmer active listing limit<input name="farmer_limit" required type="number" min="1" max="10000" value="{{ p.farmer_limit }}"></label>
+  <label>Buyer active request limit<input name="buyer_limit" required type="number" min="1" max="10000" value="{{ p.buyer_limit }}"></label>
+  {% else %}
+  <label>Monthly price (ZAR)<input name="price" type="number" required min=".01" max="100000" step=".01" value="{{ '%.2f'|format(p.price_cents/100) }}"></label>
+  <label>Active limit (leave blank for unlimited)<input name="active_limit" type="number" min="1" max="10000" value="{{ p[p.role ~ '_limit'] or '' }}"></label>
+  {% endif %}
+  <label>Daily Harvest Guide requests<input name="guide_daily" type="number" required min="1" max="10000" value="{{ p.guide_daily }}"></label>
+  <button class="action-main">Save plan</button>
+</form>
+{% endfor %}
+</div>
+<section class="workspace-card pilot-space"><h2>Mock access periods</h2>
+<ul>{% for p in periods %}<li>{{ p.email }} · {{ p.name }} · {{ p.starts_on }} to {{ p.ends_on }} · {{ _('Expired') if p.ends_on<=today else 'Current period' }}{% if p.cancel_renewal %} · renewal cancelled{% endif %}</li>{% else %}<li>No periods yet.</li>{% endfor %}</ul></section>
+<section class="workspace-card pilot-space"><h2>Mock billing failures</h2>
+<ul>{% for f in failures %}<li>{{ f.created_at }} · {{ f.email }} · {{ f.reference }}</li>{% else %}<li>No failed attempts.</li>{% endfor %}</ul></section>
+<section class="workspace-card pilot-space"><h2>Subscription audit</h2>
+<ul>{% for e in events %}<li>{{ e.created_at }} · {{ e.kind }} · {{ e.details }} · {{ 'Admin #' ~ e.admin_id if e.admin_id else 'Account #' ~ e.user_id }}</li>{% else %}<li>No events yet.</li>{% endfor %}</ul></section>
+{% endblock %}

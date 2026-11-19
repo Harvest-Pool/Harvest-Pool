@@ -1,0 +1,84 @@
+{% extends 'base.html' %}
+{% block title %}{{ _('Seller Verification Centre') }} · Harvest Pool{% endblock %}
+{% block content %}
+<section class="plan-section">
+<h1>{{ _('Seller Verification Centre') }}</h1>
+<p>{{ _('Identity, supply and listing evidence are reviewed separately.') }}</p>
+<div class="pilot-grid">
+  {% for key in ('identity','supply') %}
+  <article class="workspace-card"><h2>{{ _(dimensions[key]) }}</h2><strong class="state-pill">{{ _(states.get(key,'Not Submitted')) }}</strong></article>
+  {% endfor %}
+  <article class="workspace-card"><h2>{{ _('Marketplace eligibility') }}</h2>
+  <strong class="state-pill">{{ _('Seller verified') if flags.verified else (_('Approved seller access') if flags.eligible else _('Seller checks required')) }}</strong></article>
+</div>
+<section class="workspace-card pilot-space" id="privacy">
+<h2>{{ _('Evidence privacy notice') }}</h2>
+{% if enabled %}
+<p lang="en"><strong>{{ controller }}</strong> uses evidence to assess seller identity, supply legitimacy and listing claims. {{ basis }}</p>
+<p lang="en">Access is limited to you and authorised reviewers. Files are encrypted and expire from the review interface after 90 days. Verification decisions and limited audit information remain available for accountability. Use the privacy request form below to request access, correction, deletion or to object.</p>
+<p lang="en">Privacy contact <strong>{{ privacy_contact }}</strong>. Only submit necessary evidence. Never enter a full identity number in text fields. If you prefer an in-person identity check, use the assisted route.</p>
+{% else %}<p>{{ _('Document intake is unavailable. Contact the marketplace administrator for an assisted review.') }}</p>{% endif %}
+</section>
+{% if enabled %}
+<div class="pilot-grid pilot-space">
+{% for key,label in dimensions.items() %}
+{% if key != 'batch' or listings %}
+<form class="workspace-card modern-form" method="post" enctype="multipart/form-data" action="{{ url_for('submit_kyc',dimension=key) }}">
+  <h2>{{ _(label) }}</h2>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  {% if key == 'identity' %}
+    <label>Verification route<select name="route"><option value="document">Document review</option><option value="assisted">Assisted independent identity check</option></select></label>
+    <label>Document type, if uploading<select name="document_type">
+      <option value="sa-id">South African ID</option><option value="passport">Passport</option>
+      <option value="certified-sa-id">Certified copy of South African ID</option><option value="certified-passport">Certified copy of passport</option>
+    </select></label>
+    <p lang="en">Providing documents is voluntary. Use the assisted route to continue without uploading identity documents. Identity and supply checks are required for new public seller approval.</p>
+    <p>Use the assisted route if a certified copy is unavailable or you prefer to show an original privately.</p>
+  {% elif key == 'supply' %}
+    <label>Private production location<input name="location" maxlength="180" required></label>
+    <label>Relationship to land or produce<select name="relationship"><option value="owner">Owner</option><option value="lease">Lease</option><option value="communal">Communal land</option><option value="permission">Permission to farm</option><option value="cooperative">Cooperative</option><option value="supplier">Supplier arrangement</option></select></label>
+    <label>Crop photo date<input name="photo_date" type="date" required></label>
+    <label>{{ _('Quantity (kg)') }}<input name="quantity" type="number" min=".01" max="1000000" step=".01" required></label>
+    <label>{{ _('Harvest-ready date') }}<input name="harvest_date" type="date" required></label>
+    <label>Optional supplier, weighing or inspection record reference<input name="supporting_record" maxlength="180"></label>
+    <p>Add a dated crop photo. A second image can show permission, a weighing record or related evidence.</p>
+  {% else %}
+    <label>{{ _('Your listing') }}<select name="listing_id" required>{% for row in listings %}<option value="{{ row.id }}">{{ row.crop }} · #{{ row.id }}</option>{% endfor %}</select></label>
+    <label>Batch reference<input name="batch" maxlength="180" required></label>
+    <label>Seller-declared quality<input name="declaration" maxlength="180" placeholder="Use the applicable crop classification" required></label>
+    <label>Issuing organisation, if applicable<input name="issuer" maxlength="180"></label>
+    <label>Certificate or inspection reference<input name="reference" maxlength="180"></label>
+    <label>Certificate expiry, if applicable<input name="certificate_date" type="date"></label>
+  {% endif %}
+  <label>{{ _('Evidence images') }}<input type="file" name="evidence" multiple accept="image/jpeg,image/png" {% if key != 'identity' %}required{% endif %}></label>
+  <small>JPEG or PNG, up to two images, 2 MB each. Images are reviewed by a person and never establish a grade on their own.</small>
+  <label class="checkline"><input type="checkbox" name="privacy_notice" value="read" required>{{ _('I have read the evidence privacy notice.') }}</label>
+  <button class="action-main">{{ _('Submit evidence') }}</button>
+</form>
+{% endif %}
+{% endfor %}
+</div>
+{% endif %}
+<section class="workspace-card pilot-space"><h2>{{ _('Evidence history') }}</h2>
+{% for c in cases %}
+  <article class="verification-history">
+  <strong>{{ _(dimensions[c.dimension]) }} · #{{ c.id }}{% if c.crop %} · {{ c.crop }}{% endif %}</strong>
+  <p>{{ c.created_at }} · {{ _(case_states[c.id]) }}{% if c.expires_on %} · {{ _('Valid through') }} {{ c.expires_on }}{% endif %}</p>
+  {% if c.feedback %}<p>{{ c.feedback }}</p>{% endif %}
+  {% if c.purged_at %}<p>{{ _('Evidence file removed') }}</p>
+  {% elif enabled and c.retain_until %}<p>{{ _('Evidence accessible through') }} {{ c.retain_until }}</p>
+  {% for index in range(c.image_count or 0) %}<a href="{{ url_for('kyc_image',case_id=c.id,image_index=index) }}" rel="noreferrer">{{ _('View evidence image') }} {{ index+1 }}</a> {% endfor %}
+  {% endif %}
+  </article>
+{% else %}<p>{{ _('No evidence submitted.') }}</p>{% endfor %}
+</section>
+<section class="workspace-card pilot-space"><h2>{{ _('Privacy requests') }}</h2>
+<form method="post" class="modern-form" action="{{ url_for('kyc_privacy') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <label>{{ _('Request type') }}<select name="kind"><option value="access">Access</option><option value="correction">Correction</option><option value="deletion">Deletion</option><option value="objection">Objection</option></select></label>
+  <button class="action-soft">{{ _('Submit privacy request') }}</button>
+</form>
+<ul>{% for item in privacy %}<li>#{{ item.id }} · {{ _(item.kind|capitalize) }} · {{ _(item.status) }} · {{ item.created_at }}</li>{% endfor %}</ul>
+</section>
+</section>
+{% endblock %}
