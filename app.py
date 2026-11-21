@@ -718,7 +718,9 @@ def dashboard():
             my_contributions = db.execute('''
                 SELECT pc.id, pc.quantity_kg, pc.indicative_price, pc.offer_status,
                        pc.farmer_asking_price, pc.transport_cost, pc.packaging_cost, pc.demo_ready, p.crop, hp.status,
-                       b.business_name, o.id AS demo_order_id, o.status AS demo_order_status
+                       b.business_name, o.id AS demo_order_id, o.status AS demo_order_status,
+                       EXISTS(SELECT 1 FROM paystack_test_payments t
+                           WHERE t.order_id=o.id AND t.status='verified_test') AS demo_paystack_verified
                 FROM pool_contributions pc
                 JOIN produce_listings p ON p.id = pc.listing_id
                 JOIN harvest_pools hp ON hp.id = pc.pool_id
@@ -763,6 +765,8 @@ def dashboard():
             WHERE d.buyer_id = ? ORDER BY hp.id DESC
         ''', (current_user.profile_id,)).fetchall()
         demo_orders = db.execute("""SELECT o.*, d.crop, d.quantity_kg, d.delivery_location,
+                    EXISTS(SELECT 1 FROM paystack_test_payments t
+                        WHERE t.order_id=o.id AND t.status='verified_test') AS paystack_verified,
                     (SELECT COUNT(*) FROM pool_contributions pc
                      JOIN harvest_pools hp ON hp.id=pc.pool_id
                      WHERE hp.demand_id=o.demand_id AND pc.offer_status='Accepted') AS accepted_count,
@@ -938,6 +942,10 @@ def match_supply(demand_id):
         if not demand:
             db.rollback()
             abort(404)
+        today = date.today().isoformat()
+        if demand['deadline'] < today:
+            flash('This sourcing request has expired.', 'error')
+            return redirect(url_for('dashboard'))
         if db.execute('SELECT 1 FROM demo_orders WHERE demand_id=?', (demand_id,)).fetchone():
             db.rollback()
             flash('This request is already in the demo order workflow.', 'error')
@@ -964,14 +972,17 @@ def match_supply(demand_id):
             # does not promise the same kilograms to multiple buyers.
             listings = db.execute('''SELECT p.*,
                 COALESCE((SELECT SUM(pc.quantity_kg) FROM pool_contributions pc
-                          WHERE pc.listing_id=p.id AND pc.offer_status='Pending'),0) AS pending_kg
+                          JOIN harvest_pools hp ON hp.id=pc.pool_id
+                          JOIN buyer_demands d ON d.id=hp.demand_id
+                          WHERE pc.listing_id=p.id AND pc.offer_status='Pending'
+                          AND d.deadline>=?),0) AS pending_kg
                 FROM produce_listings p JOIN farmers f ON f.id=p.farmer_id
                 JOIN seller_eligibility se ON se.farmer_id=f.id
                 WHERE se.eligible=1 AND LOWER(p.crop)=LOWER(?) AND p.available_kg > 0 AND p.harvest_date <= ?
                   AND p.asking_price IS NOT NULL AND p.asking_price <= ?
                   AND p.available_until >= ?
                 ORDER BY p.asking_price ASC, p.harvest_date ASC, p.id ASC''',
-                (demand['crop'], demand['deadline'], demand['target_price'], date.today().isoformat())).fetchall()
+                (today, demand['crop'], demand['deadline'], demand['target_price'], today)).fetchall()
             for listing in listings:
                 if remaining <= 0.00001:
                     break
@@ -1010,8 +1021,10 @@ def respond_to_offer(contribution_id, decision):
     db = get_db()
     try:
         db.execute('BEGIN IMMEDIATE')
-        offer = db.execute('''SELECT pc.*, p.available_kg, p.available_until,se.eligible
+        offer = db.execute('''SELECT pc.*, p.available_kg, p.available_until,se.eligible,d.deadline
             FROM pool_contributions pc
+            JOIN harvest_pools hp ON hp.id=pc.pool_id
+            JOIN buyer_demands d ON d.id=hp.demand_id
             JOIN produce_listings p ON p.id=pc.listing_id
             JOIN seller_eligibility se ON se.farmer_id=p.farmer_id
             WHERE pc.id=? AND pc.farmer_id=? AND p.farmer_id=?''',
@@ -1030,6 +1043,9 @@ def respond_to_offer(contribution_id, decision):
             flash('This offer has already been handled or belongs to an older test pool.', 'error')
             return redirect(url_for('dashboard'))
         if decision == 'accept':
+            if offer['deadline'] < date.today().isoformat():
+                flash('This sourcing request has expired.', 'error')
+                return redirect(url_for('dashboard'))
             if not offer['eligible']:
                 db.rollback()
                 flash('Seller review approval is required before accepting a new offer.', 'error')
@@ -1170,7 +1186,9 @@ def create_demo_order(demand_id):
 def order_allocations_detail(order_id):
     db = get_db()
     try:
-        order = db.execute("""SELECT o.*, d.crop, d.delivery_location, b.business_name
+        order = db.execute("""SELECT o.*, d.crop, d.delivery_location, b.business_name,
+                EXISTS(SELECT 1 FROM paystack_test_payments t
+                    WHERE t.order_id=o.id AND t.status='verified_test') AS paystack_verified
             FROM demo_orders o
             JOIN buyer_demands d ON d.id=o.demand_id
             JOIN buyers b ON b.id=o.buyer_id WHERE o.id=?""", (order_id,)).fetchone()
@@ -1242,7 +1260,9 @@ def demo_mark_ready(order_id, contribution_id):
     db = get_db()
     try:
         db.execute('BEGIN IMMEDIATE')
-        order = db.execute('''SELECT o.* FROM demo_orders o WHERE o.id=?''', (order_id,)).fetchone()
+        order = db.execute('''SELECT o.*, EXISTS(SELECT 1 FROM paystack_test_payments t
+            WHERE t.order_id=o.id AND t.status='verified_test') AS paystack_verified
+            FROM demo_orders o WHERE o.id=?''', (order_id,)).fetchone()
         if not order:
             db.rollback()
             abort(404)
@@ -1254,9 +1274,11 @@ def demo_mark_ready(order_id, contribution_id):
         if not row:
             db.rollback()
             abort(404)
-        if order['status'] not in ('Demo payment marked','Ready for demo delivery'):
+        payment_recorded = (order['status'] in ('Demo payment marked','Ready for demo delivery')
+                            or (order['status'] == 'Awaiting demo payment' and order['paystack_verified']))
+        if not payment_recorded:
             db.rollback()
-            flash('The buyer must mark demo payment before produce can be marked ready.', 'error')
+            flash('A verified Paystack test payment or a recorded demo payment is required before marking produce ready.', 'error')
             return redirect(url_for('dashboard'))
         db.execute('UPDATE pool_contributions SET demo_ready=1 WHERE id=?', (contribution_id,))
         counts = db.execute('''SELECT COUNT(*) AS total,
@@ -1702,7 +1724,7 @@ def admin_review_seller(farmer_id):
                 if not app.config['DEMO_MODE'] or request.form.get('demo_attest') != 'yes':
                     flash('Confirm the designated demo seller in an isolated demo environment.', 'error')
                     return redirect(url_for('admin_dashboard'))
-                note = 'DEMO ACCOUNT ? ' + note
+                note = 'DEMO ACCOUNT: ' + note
             elif request.form.get('attest') != 'yes':
                 flash('Before approval, confirm you personally completed the required checks.', 'error')
                 return redirect(url_for('admin_dashboard'))

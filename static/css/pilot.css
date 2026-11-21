@@ -36,9 +36,13 @@
 .pilot-comparison[data-preview="after"] img{max-width:26rem}
 .market-feedback{min-height:1.35em;margin:.15rem 0 .65rem;color:#365b46;font-size:.9rem}
 #market-listings[aria-busy="true"]{opacity:.64}
-@media (max-width:780px){
-  .site-header .header-inner{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center}
-  .site-header .site-nav:not([hidden]){width:100%;display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-start;gap:.6rem 1rem;padding:.5rem 0 .8rem}
+.site-header .brand{white-space:nowrap;flex:none}
+.site-header .site-nav{min-width:0;justify-content:flex-end;gap:.55rem 1rem}
+.site-header .language-selector label{min-width:0}
+.site-header .language-selector select{width:10rem}
+@media (max-width:1120px){
+  .site-header .header-inner{width:100%;display:flex;flex-flow:row wrap;justify-content:space-between;align-items:center;min-height:3.75rem;gap:.5rem;padding:.45rem 0}
+  .site-header .site-nav:not([hidden]){flex:0 0 100%;display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-start;gap:.6rem 1rem;padding:.5rem 0 .8rem}
 }
 @media (prefers-reduced-motion:reduce){.mp-card,.pilot-comparison figure,.pilot-process li{transition:none;animation:none}}
 
@@ -59,3 +63,23 @@
 .verification-badges{display:flex;gap:.25rem .4rem;flex-wrap:wrap;margin:.35rem 0}
 .verification-badges:empty{display:none}
 .verification-badges .state-pill{white-space:normal}
+
+@media (max-width:600px){
+  .assistant-widget .assistant-launch{width:44px;height:44px;justify-content:center;padding:0}
+  .assistant-launch span:last-child{display:none}
+  body:has(main input:focus,main select:focus,main textarea:focus) .assistant-widget:not(:has(.assistant-panel:not([hidden]))) .assistant-launch{visibility:hidden}
+}
+
+.workspace-navigation{display:flex;flex-direction:column;flex:1}
+.workspace-navigation[hidden]{display:none}
+@media(max-width:950px){
+  .workspace-header{display:flex;align-items:center;justify-content:space-between;gap:.5rem}
+  .workspace-header .app-logo{margin:0}
+  .workspace-navigation:not([hidden]){padding-top:.75rem}
+  .workspace-navigation .sidebar-bottom{display:block}
+  .workspace-navigation .sidebar-help{display:none}
+  .workspace-navigation .side-nav{flex-wrap:wrap}
+}
+
+.site-menu-toggle:hover,.site-menu-toggle[aria-expanded="true"]{background:#e3efe0;color:#173b2c}
+body:has(.site-menu-toggle[aria-expanded="true"]) .assistant-widget:not(:has(.assistant-panel:not([hidden]))) .assistant-launch{visibility:hidden}

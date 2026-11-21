@@ -1,5 +1,5 @@
 {% extends 'base.html' %}
-{% block title %}Financial planning ? Harvest Pool{% endblock %}
+{% block title %}Financial planning · Harvest Pool{% endblock %}
 {% macro zar(value) %}R{{ '{:,.2f}'.format(value) }}{% endmacro %}
 {% macro fields(spec, values) %}
 <div class="pilot-grid pilot-fields">
@@ -45,7 +45,7 @@
 <p>Assumes constant monthly volume, zero opening cash and no pre-existing receivables or payables. Service receipts lag {{ inputs.collections_lag }} month(s) and variable supplier costs lag {{ inputs.cost_lag }} month(s). Gateway fees and fixed costs are paid in the order month. Cash excludes pass-through produce proceeds, taxes, VAT, financing and capital expenditure.</p>
 <div class="pilot-table"><table><thead><tr><th>Month</th><th>Produce GMV</th><th>Service revenue</th><th>Operating profit</th><th>Net cash flow</th><th>Cumulative cash flow</th></tr></thead>
 <tbody>{% for row in model.months %}<tr><th scope="row">{{ row[0] }}</th>{% for value in row[1:] %}<td>{{ zar(value) }}</td>{% endfor %}</tr>{% endfor %}</tbody></table></div></section>
-<section class="workspace-card pilot-space"><h2>Example ? 1,000 kg of potatoes</h2>
+<section class="workspace-card pilot-space"><h2>Example · 1,000 kg of potatoes</h2>
 <p>R15 per kg yields R15,000 in produce GMV. The example uses one labelled unit per kilogram, full packaging, one new design and the original pilot rates.</p>
 <dl class="pilot-breakdown">
 {% for key, value in example_revenue.items() %}<div><dt>{{ key|capitalize }} revenue</dt><dd>{{ zar(value) }}</dd></div>{% endfor %}

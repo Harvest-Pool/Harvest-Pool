@@ -134,6 +134,37 @@ class HarvestPoolTests(unittest.TestCase):
         self.form(farmer, "/logout", {})
         self.assertEqual(farmer.get("/dashboard").status_code, 302)
 
+    def test_expired_pending_offer_cannot_hold_or_consume_supply(self):
+        farmer, farmer_id = self.account("farmer", 1)
+        buyer, _ = self.account("buyer", 2)
+        other, _ = self.account("buyer", 3)
+        listing = self.listing(farmer, farmer_id, qty=100)
+        self.approve(farmer_id)
+        demand = dict(crop="Potatoes", quantity_kg=100, target_price=15,
+                      deadline=self.expiry, delivery_location="Vhembe")
+        self.form(buyer, "/demands/add", demand)
+        self.form(buyer, "/match/1", {})
+        self.assertEqual(self.row("SELECT COUNT(*) FROM pool_contributions")[0], 1)
+        self.execute("UPDATE buyer_demands SET deadline='2000-01-01' WHERE id=1")
+        response = self.form(farmer, "/offers/1/accept", {"transport_cost":0,"packaging_cost":0},
+                             follow_redirects=True)
+        self.assertIn(b"This sourcing request has expired.", response.data)
+        self.assertEqual(self.row("SELECT available_kg FROM produce_listings WHERE id=?", listing)[0], 100)
+        self.assertIn(b"This sourcing request has expired.",
+                      self.form(buyer, "/match/1", {}, follow_redirects=True).data)
+        self.form(other, "/demands/add", demand)
+        self.form(other, "/match/2", {})
+        self.assertEqual(self.row("SELECT quantity_kg FROM pool_contributions WHERE id=2")[0], 100)
+
+    def test_packaging_translation_uses_plain_text_catalogue_keys(self):
+        client = self.app.test_client()
+        for url in ("/", "/packaging"):
+            html = client.get(url).data
+            self.assertIn(b"Packaging &amp; branding", html)
+            self.assertNotIn(b"&amp;amp;", html)
+        self.form(client, "/language", {"locale":"zu-ZA","return_to":"/packaging"})
+        self.assertIn("Ukupakisha namalebula".encode(), client.get("/packaging").data)
+
     def test_logout_returns_a_blank_uncached_sign_in_form(self):
         for client in (self.account("buyer", 1)[0], self.admin):
             result = self.form(client, "/logout", {})
@@ -223,6 +254,16 @@ class HarvestPoolTests(unittest.TestCase):
         sums = self.row("SELECT COUNT(*), SUM(gross_cents), SUM(platform_fee_cents) FROM test_settlement_allocations")
         self.assertEqual(tuple(sums), (2, 1500000, 0))
         self.assertEqual(self.row("SELECT COUNT(*) FROM paystack_test_events WHERE provider_status='success' AND event_type='verification'")[0], 1)
+        self.assertIn(b"Paystack test verified", buyer.get(f"/orders/{order_id}/allocations").data)
+        for farmer_client, farmer_id in ((first, first_id), (second, second_id)):
+            contribution = self.row("SELECT id FROM pool_contributions WHERE farmer_id=?", farmer_id)[0]
+            ready = f"/demo-orders/{order_id}/ready/{contribution}"
+            self.assertIn(ready.encode(), farmer_client.get("/dashboard").data)
+            self.form(farmer_client, ready, {})
+        self.assertEqual(self.row("SELECT status FROM demo_orders WHERE id=?", order_id)[0], "Ready for demo delivery")
+        self.form(buyer, f"/demo-orders/{order_id}/confirm-delivery", {})
+        self.assertEqual(self.row("SELECT status FROM demo_orders WHERE id=?", order_id)[0], "Demo delivery confirmed")
+
 
     def test_quote_scope_review_and_finance_rates(self):
         farmer, farmer_id = self.account("farmer", 1)

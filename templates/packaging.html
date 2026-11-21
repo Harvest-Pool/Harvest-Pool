@@ -1,5 +1,5 @@
 {% extends 'base.html' %}
-{% block title %}Packaging &amp; branding ? Harvest Pool{% endblock %}
+{% block title %}{{ _('Packaging & branding') }} · Harvest Pool{% endblock %}
 {% block content %}
 {% include 'packaging_intro.html' %}
 <section class="pilot-section">
@@ -16,9 +16,9 @@
     {% if listings %}
     <form class="modern-form workspace-card" method="post" action="{{ url_for('request_packaging') }}" id="quote-form"
           data-pack="{{ rates.pack_price }}" data-label="{{ rates.label_price }}" data-art="{{ rates.art_price }}">
-      <h2>{{ _('Request packaging &amp; branding') }}</h2>
+      <h2>{{ _('Request packaging & branding') }}</h2>
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <label>{{ _('Your listing') }}<select name="listing_id" required>{% for row in listings %}<option value="{{ row.id }}" data-stock="{{ row.available_kg }}">{{ row.crop }} ? {{ row.available_kg }} kg available ? #{{ row.id }}</option>{% endfor %}</select></label>
+      <label>{{ _('Your listing') }}<select name="listing_id" required>{% for row in listings %}<option value="{{ row.id }}" data-stock="{{ row.available_kg }}">{{ row.crop }} · {{ row.available_kg }} kg available · #{{ row.id }}</option>{% endfor %}</select></label>
       <div class="form-pair">
         <label>{{ _('Service') }}<select name="service">{% for key, label in services.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></label>
         <label>{{ _('Produce quantity (kg)') }}<input name="quantity_kg" type="number" min="0.01" max="1000000" step="0.01" required></label>
@@ -38,9 +38,9 @@
     <div class="pilot-grid">
       {% for q in quotes %}
       <article class="workspace-card">
-        <span class="state-pill">{{ _(q.status) }}</span><h3>#{{ q.id }} ? {{ q.crop }}</h3>
-        <p>{{ services[q.service] }} ? {{ q.quantity_kg }} kg ? {{ q.labelled_units }} labelled units</p>
-        <p>Estimate R{{ '%.2f'|format(q.estimate_cents / 100) }}{% if q.quote_cents is not none %} ? Reviewed quote R{{ '%.2f'|format(q.quote_cents / 100) }}{% endif %}</p>
+        <span class="state-pill">{{ _(q.status) }}</span><h3>#{{ q.id }} · {{ q.crop }}</h3>
+        <p>{{ services[q.service] }} · {{ q.quantity_kg }} kg · {{ q.labelled_units }} labelled units</p>
+        <p>Estimate R{{ '%.2f'|format(q.estimate_cents / 100) }}{% if q.quote_cents is not none %} · Reviewed quote R{{ '%.2f'|format(q.quote_cents / 100) }}{% endif %}</p>
         {% if q.review_note %}<p>{{ q.review_note }}</p>{% endif %}
       </article>
       {% else %}<p>Your submitted quote requests will appear here.</p>{% endfor %}
